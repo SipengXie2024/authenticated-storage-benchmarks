@@ -5,7 +5,8 @@
       "Bash(ls:*)",
       "Skill(rust)",
       "mcp__ide__getDiagnostics",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "mcp__thinking__sequentialthinking"
     ]
   },
   "enableAllProjectMcpServers": true,
