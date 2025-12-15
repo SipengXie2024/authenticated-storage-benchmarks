@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@upstash/context7-mcp"
+      ]
+    },
+    "thinking": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    },
+    "claude-context": {
+      "command": "cmd",
+      "args": ["/c","npx", "@zilliz/claude-context-mcp@latest"],
+      "env": {
+        "OPENAI_BASE_URL":"https://api.siliconflow.cn/v1/",
+        "EMBEDDING_MODEL":"BAAI/bge-m3",
+        "OPENAI_API_KEY": "sk-rfflpruiwyxprkwxqfzxrdhwdqbwcowsyhcxsqkmjafaeaat",
+        "MILVUS_ADDRESS":"http://124.71.154.57:19530",
+        "MILVUS_TOKEN": "root:blockchain@123"
+      }
+    }
+  }
+}
