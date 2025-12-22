@@ -298,20 +298,12 @@ impl PersistentHOTNode {
         }
 
         // 3. Discriminative bits 排序
-        if !self
-            .discriminative_bits
-            .windows(2)
-            .all(|w| w[0] < w[1])
-        {
+        if !self.discriminative_bits.windows(2).all(|w| w[0] < w[1]) {
             return Err("discriminative_bits not strictly sorted".to_string());
         }
 
         // 4. Sparse partial keys 排序（确保序列化确定性）
-        if !self
-            .sparse_partial_keys
-            .windows(2)
-            .all(|w| w[0] <= w[1])
-        {
+        if !self.sparse_partial_keys.windows(2).all(|w| w[0] <= w[1]) {
             return Err("sparse_partial_keys not sorted".to_string());
         }
 
@@ -366,19 +358,27 @@ impl PersistentHOTNode {
     ///
     /// 使用 sparse partial key 匹配逻辑：`(dense & sparse) == sparse`
     ///
+    /// 参考论文 Listing 2 和 C++ 实现 (HOTSingleThreadedNodeBase::toResultIndex):
+    /// - SIMD 搜索返回所有匹配项的位掩码
+    /// - 使用 CLZ/BSR 选择最高位索引（即最后一个匹配项）
+    /// - 这确保选择最具体的匹配（sparse key 值最大的）
+    ///
     /// # 返回
     /// - `Some(index)`: 找到匹配的 child 索引
     /// - `None`: 无匹配（理论上不应发生，除非数据损坏）
     pub fn search(&self, key: &[u8]) -> Option<usize> {
         let dense_key = self.extract_dense_partial_key(key);
 
+        // 遍历所有条目，返回最后一个匹配项
+        // 这模拟了 C++ 中使用 BSR 找最高位的行为
+        let mut result = None;
         for (i, &sparse_key) in self.sparse_partial_keys.iter().enumerate() {
             if (dense_key & sparse_key) == sparse_key {
-                return Some(i);
+                result = Some(i);
             }
         }
 
-        None
+        result
     }
 }
 
@@ -420,9 +420,11 @@ pub fn find_first_differing_bit(key1: &[u8], key2: &[u8]) -> Option<u16> {
         if key1[i] != key2[i] {
             // 找到第一个不同的字节
             let xor = key1[i] ^ key2[i];
-            // 找到该字节中第一个不同的 bit（从高位开始）
-            let bit_in_byte = xor.leading_zeros() as u16 - 24; // u8 的 leading_zeros 从 32 开始
-            return Some((i as u16) * 8 + (7 - bit_in_byte));
+            // 找到该字节中第一个不同的 bit（从高位开始，MSB-first）
+            // C++ 使用 __builtin_clz(uint32_t) - 24，因为 clz 操作 32-bit 整数
+            // Rust 的 u8::leading_zeros() 直接返回 0-8，语义等同于 clz(x) - 24
+            let bit_in_byte = xor.leading_zeros() as u16;
+            return Some((i as u16) * 8 + bit_in_byte);
         }
     }
 
@@ -432,8 +434,8 @@ pub fn find_first_differing_bit(key1: &[u8], key2: &[u8]) -> Option<u16> {
         let longer = if key1.len() > key2.len() { key1 } else { key2 };
         for i in min_len..longer.len() {
             if longer[i] != 0 {
-                let bit_in_byte = longer[i].leading_zeros() as u16 - 24;
-                return Some((i as u16) * 8 + (7 - bit_in_byte));
+                let bit_in_byte = longer[i].leading_zeros() as u16;
+                return Some((i as u16) * 8 + bit_in_byte);
             }
         }
     }
@@ -539,7 +541,10 @@ mod tests {
         // 不同哈希函数应产生不同 ID
         let blake3_id = node.compute_node_id::<Blake3Hasher>();
         let keccak_id = node.compute_node_id::<Keccak256Hasher>();
-        assert_ne!(blake3_id, keccak_id, "Different hashers should produce different IDs");
+        assert_ne!(
+            blake3_id, keccak_id,
+            "Different hashers should produce different IDs"
+        );
     }
 
     #[test]

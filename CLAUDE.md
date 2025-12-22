@@ -84,3 +84,19 @@ asb-profile/       -> Metrics collection and reporting
 - Create `./pp` directory for cryptography parameters (LVMT/AMT)
 - First run of LVMT/AMT generates crypto params (can take hours)
 - For LMPTs: manually modify `asb-backend/Cargo.toml` to switch RocksDB dependencies due to version conflicts
+
+## GCC 13+ 兼容性问题
+
+在 GCC 13 或更新版本的系统上（如 Ubuntu 24.04），RocksDB 编译会失败，报错 `'uint64_t' does not name a type`。
+
+**原因**：GCC 13 对 C++ 标准头文件更严格，旧版 RocksDB 代码缺少 `#include <cstdint>`
+
+**解决方案**：编译时设置 `CXXFLAGS` 环境变量：
+
+```bash
+# 单次编译
+CXXFLAGS="-include cstdint" cargo build --release
+
+# 或永久设置（加入 ~/.bashrc）
+export CXXFLAGS="-include cstdint"
+```

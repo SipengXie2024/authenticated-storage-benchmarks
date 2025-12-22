@@ -70,7 +70,9 @@
 
 pub mod hash;
 pub mod node;
+pub mod store;
 
 // 重新导出常用类型
 pub use hash::{Blake3Hasher, HashOutput, Hasher, Keccak256Hasher};
 pub use node::{extract_bit, find_first_differing_bit, ChildRef, NodeId, PersistentHOTNode};
+pub use store::{MemoryNodeStore, NodeStore, Result as StoreResult, StoreError};

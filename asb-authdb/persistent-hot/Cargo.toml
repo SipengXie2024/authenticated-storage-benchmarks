@@ -11,7 +11,7 @@ serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 
 # Hash 函数
-blake3 = "1.5"
+blake3 = "=1.4.1"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 
 [dev-dependencies]
