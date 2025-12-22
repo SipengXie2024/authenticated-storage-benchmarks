@@ -29,8 +29,8 @@
 //!
 //! # 开发阶段
 //!
-//! - **阶段 1**（当前）：核心数据结构与序列化
-//! - 阶段 2：存储抽象层（NodeStore trait）
+//! - 阶段 1：核心数据结构与序列化 ✅
+//! - **阶段 2**（当前）：存储抽象层（NodeStore trait）✅
 //! - 阶段 3：Lookup 操作
 //! - 阶段 4：Insert 操作（四种插入方式）
 //! - 阶段 5：RocksDB 集成 + AuthDB trait 实现
@@ -76,3 +76,7 @@ pub mod store;
 pub use hash::{Blake3Hasher, HashOutput, Hasher, Keccak256Hasher};
 pub use node::{extract_bit, find_first_differing_bit, ChildRef, NodeId, PersistentHOTNode};
 pub use store::{MemoryNodeStore, NodeStore, Result as StoreResult, StoreError};
+
+// kvdb-backend feature 启用时导出 KvNodeStore
+#[cfg(feature = "kvdb-backend")]
+pub use store::KvNodeStore;

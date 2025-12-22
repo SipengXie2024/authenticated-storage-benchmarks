@@ -2732,6 +2732,8 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "kvdb",
+ "kvdb-memorydb",
  "rand 0.8.4",
  "serde",
  "tiny-keccak 2.0.2",
