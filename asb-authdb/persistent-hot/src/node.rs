@@ -1,127 +1,231 @@
 //! HOT 节点核心数据结构
 //!
 //! 本模块定义了持久化 HOT 的核心类型：
+//! - `NodeId`: 40 字节节点标识符（8 字节 version + 32 字节 content hash）
+//! - `LeafData`: 叶子数据（单独存储）
+//! - `ChildRef`: 子节点引用（统一使用 NodeId）
 //! - `PersistentHOTNode`: HOT 复合节点的持久化表示
-//! - `ChildRef`: 子节点引用（内部节点 ID 或叶子数据）
-//! - `NodeId`: 节点标识符（32字节哈希）
-//!
-//! # 与 C++ HOT 的对应关系
-//!
-//! | C++ 原版 | Rust 持久化版 | 说明 |
-//! |----------|---------------|------|
-//! | `BiNode` | 隐含在 `discriminative_bits` | 每个 bit 位置对应一个逻辑 BiNode |
-//! | `SparsePartialKeys` | `sparse_partial_keys: Vec<u32>` | 稀疏部分键数组 |
-//! | `ChildPointer[]` | `children: Vec<ChildRef>` | 子节点引用数组 |
-//! | Node height | `height: u16` | 节点高度 |
+//! - `SearchResult`: 节点内搜索结果
 //!
 //! # 设计决策
 //!
-//! 1. **放弃 SIMD 优化**：持久化场景下 I/O 时间主导，SIMD 节省的 ~1ns 可忽略
-//! 2. **使用 `Vec` 而非固定数组**：简化序列化，保持灵活性
-//! 3. **排序存储**：`sparse_partial_keys` 按值排序，确保序列化确定性
-//! 4. **Content-Addressed**：节点 ID = 节点内容的哈希
+//! 1. **40 字节 NodeId**: 包含 version 用于历史查询和垃圾回收
+//! 2. **叶子数据单独存储**: 节点大小可预测，支持大 value
+//! 3. **固定数组布局**: SIMD 友好，缓存效率高
+//! 4. **Content-Addressed**: 节点 ID = 节点内容的哈希
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
+use crate::bits::pext64;
 use crate::hash::Hasher;
 
-/// 节点标识符：32字节哈希值
-///
-/// 在 content-addressed 存储中，NodeId 是节点序列化内容的哈希。
-/// 相同内容的节点具有相同的 NodeId，实现自动去重。
-///
-/// 后续 Merkle 化时，NodeId 将作为节点的 commitment。
-pub type NodeId = [u8; 32];
+// ============================================================================
+// NodeId
+// ============================================================================
 
-/// HOT 节点的持久化表示
-///
-/// 对应论文中的 Compound Node（复合节点），最多包含 k=32 个 entries。
-///
-/// # 核心概念
-///
-/// ## Discriminative Bits
-/// `discriminative_bits` 存储需要检查的 bit 位置（绝对索引）。
-/// 例如 `[3, 7, 12]` 表示检查 key 的第 3、7、12 位。
-/// 这决定了节点的 "span"（跨度）。
-///
-/// ## Sparse Partial Keys
-/// 每个 child 对应一个 sparse partial key。
-/// Sparse 的含义：只有路径上的 bit 位置有效，其他位为 0。
-/// 这与 C++ 版本的 `SparsePartialKeys` 数组对应。
-///
-/// ## 搜索逻辑
-/// 给定 search key，提取其 dense partial key（所有 discriminative bits 的值），
-/// 然后找到满足 `(dense & sparse) == sparse` 的 entry。
-///
-/// # 不变量
-///
-/// 1. `sparse_partial_keys.len() == children.len()`
-/// 2. `children.len() <= 32`（HOT 的 fanout 限制）
-/// 3. `discriminative_bits` 已排序且无重复
-/// 4. `sparse_partial_keys` 已排序（确保序列化确定性）
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PersistentHOTNode {
-    /// 节点高度
-    ///
-    /// 定义：h(n) = max(h(children)) + 1
-    /// 叶子节点的 height = 1
-    ///
-    /// 高度用于判断插入策略：
-    /// - Parent Pull Up: h(n) + 1 == h(parent)
-    /// - Intermediate Node Creation: h(n) + 1 < h(parent)
-    pub height: u16,
+/// NodeId 大小：8 字节 version + 32 字节 content hash
+pub const NODE_ID_SIZE: usize = 40;
 
-    /// 判别位索引列表（绝对 bit 位置，从 0 开始）
-    ///
-    /// 例如：key = [0x12, 0x34, ...]
-    /// - bit 0-7 在第 0 字节 (0x12)
-    /// - bit 8-15 在第 1 字节 (0x34)
-    /// - bit 3 = 0 (0x12 的第 4 位，MSB first)
-    ///
-    /// 最多 31 个（对应 32 个 children，需要 31 个二分节点）
-    pub discriminative_bits: Vec<u16>,
+/// 节点标识符：版本 + 内容哈希
+///
+/// 格式：`[version: 8 bytes big-endian][content_hash: 32 bytes]`
+///
+/// Version 的作用：
+/// - Epoch 追踪：标识数据属于哪个 commit epoch
+/// - 历史查询：支持查询特定版本的状态
+/// - 垃圾回收：根据 version 判断数据是否可回收
+/// - 冲突检测：同一 content hash 不同 version 是不同数据
+pub type NodeId = [u8; NODE_ID_SIZE];
 
-    /// 稀疏部分键数组
-    ///
-    /// 每个元素是对应 child 的 sparse partial key。
-    /// u32 足够存储最多 31 个 discriminative bits。
-    ///
-    /// **必须按值排序**以确保序列化确定性。
-    pub sparse_partial_keys: Vec<u32>,
-
-    /// 子节点引用数组
-    ///
-    /// 与 `sparse_partial_keys` 一一对应。
-    /// 顺序必须与 `sparse_partial_keys` 的排序保持一致。
-    pub children: Vec<ChildRef>,
+/// 从 version 和 content hash 构造 NodeId
+#[inline]
+pub fn make_node_id(version: u64, content_hash: &[u8; 32]) -> NodeId {
+    let mut id = [0u8; NODE_ID_SIZE];
+    id[0..8].copy_from_slice(&version.to_be_bytes());
+    id[8..40].copy_from_slice(content_hash);
+    id
 }
 
-/// 子节点引用：内部节点 ID 或叶子数据
-///
-/// # 设计说明
-///
-/// - `Internal(NodeId)`：指向另一个 HOT 节点
-/// - `Leaf { key, value }`：直接存储键值对
-///
-/// 选择存储完整 key（而非 suffix）是为了简化实现：
-/// - 查找时可直接验证 key 完全匹配
-/// - 无需沿路径收集前缀
-/// - 对于短 key，存储开销可接受
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ChildRef {
-    /// 内部节点引用（存储节点 ID）
-    Internal(NodeId),
+/// 从 NodeId 提取 version
+#[inline]
+pub fn node_id_version(id: &NodeId) -> u64 {
+    u64::from_be_bytes(id[0..8].try_into().unwrap())
+}
 
-    /// 叶子节点（直接存储完整键值对）
-    Leaf { key: Vec<u8>, value: Vec<u8> },
+/// 从 NodeId 提取 content hash
+#[inline]
+pub fn node_id_hash(id: &NodeId) -> [u8; 32] {
+    id[8..40].try_into().unwrap()
+}
+
+// ============================================================================
+// SearchResult
+// ============================================================================
+
+/// 节点搜索结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchResult {
+    /// 找到匹配的 entry
+    Found {
+        /// 匹配的索引（直接对应 children[index]）
+        index: usize,
+    },
+    /// 未找到匹配
+    NotFound {
+        /// 搜索的 dense partial key（避免重复计算）
+        dense_key: u32,
+    },
+}
+
+impl SearchResult {
+    /// 获取找到的索引
+    #[inline]
+    pub fn found_index(&self) -> Option<usize> {
+        match self {
+            SearchResult::Found { index } => Some(*index),
+            SearchResult::NotFound { .. } => None,
+        }
+    }
+
+    /// 检查是否找到
+    #[inline]
+    pub fn is_found(&self) -> bool {
+        matches!(self, SearchResult::Found { .. })
+    }
+}
+
+// ============================================================================
+// LeafData
+// ============================================================================
+
+/// 叶子数据（单独存储）
+///
+/// 与内部节点分开存储，支持大 value，节点大小可预测。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeafData {
+    /// U256 key（固定 32 字节）
+    pub key: [u8; 32],
+    /// Value（可变长度）
+    pub value: Vec<u8>,
+}
+
+impl LeafData {
+    /// 创建新叶子
+    pub fn new(key: [u8; 32], value: Vec<u8>) -> Self {
+        Self { key, value }
+    }
+
+    /// 计算 NodeId
+    pub fn compute_node_id<H: Hasher>(&self, version: u64) -> NodeId {
+        let bytes = self.to_bytes().expect("LeafData serialization should never fail");
+        let hash = H::hash(&bytes);
+        make_node_id(version, &hash)
+    }
+
+    /// 序列化为字节
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode_config().serialize(self)
+    }
+
+    /// 从字节反序列化
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode_config().deserialize(bytes)
+    }
+}
+
+// ============================================================================
+// ChildRef
+// ============================================================================
+
+/// 子节点引用
+///
+/// 保留 Internal/Leaf 区分（类型安全，调试友好），
+/// 但都使用 NodeId 引用，叶子数据单独存储。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRef {
+    /// 内部节点引用
+    Internal(NodeId),
+    /// 叶子节点引用（指向单独存储的 LeafData）
+    Leaf(NodeId),
+}
+
+// 手动实现 Serialize/Deserialize（serde 默认不支持 [u8; 40]）
+impl Serialize for ChildRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+        // 格式：(discriminant: u8, node_id: [u8; 40])
+        let mut tuple = serializer.serialize_tuple(NODE_ID_SIZE + 1)?;
+        match self {
+            ChildRef::Internal(id) => {
+                tuple.serialize_element(&0u8)?;
+                for byte in id.iter() {
+                    tuple.serialize_element(byte)?;
+                }
+            }
+            ChildRef::Leaf(id) => {
+                tuple.serialize_element(&1u8)?;
+                for byte in id.iter() {
+                    tuple.serialize_element(byte)?;
+                }
+            }
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChildRefVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ChildRefVisitor {
+            type Value = ChildRef;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a ChildRef (discriminant + 40 byte NodeId)")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let discriminant: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+
+                let mut node_id = [0u8; NODE_ID_SIZE];
+                for i in 0..NODE_ID_SIZE {
+                    node_id[i] = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i + 1, &self))?;
+                }
+
+                match discriminant {
+                    0 => Ok(ChildRef::Internal(node_id)),
+                    1 => Ok(ChildRef::Leaf(node_id)),
+                    _ => Err(serde::de::Error::custom(format!(
+                        "Invalid ChildRef discriminant: {}",
+                        discriminant
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_tuple(NODE_ID_SIZE + 1, ChildRefVisitor)
+    }
 }
 
 impl ChildRef {
     /// 检查是否为叶子节点
     #[inline]
     pub fn is_leaf(&self) -> bool {
-        matches!(self, ChildRef::Leaf { .. })
+        matches!(self, ChildRef::Leaf(_))
     }
 
     /// 检查是否为内部节点
@@ -130,42 +234,79 @@ impl ChildRef {
         matches!(self, ChildRef::Internal(_))
     }
 
-    /// 尝试获取叶子数据
-    pub fn as_leaf(&self) -> Option<(&[u8], &[u8])> {
+    /// 获取 NodeId 引用
+    #[inline]
+    pub fn node_id(&self) -> &NodeId {
         match self {
-            ChildRef::Leaf { key, value } => Some((key, value)),
-            ChildRef::Internal(_) => None,
+            ChildRef::Internal(id) | ChildRef::Leaf(id) => id,
         }
     }
 
-    /// 尝试获取内部节点 ID
-    pub fn as_internal(&self) -> Option<&NodeId> {
+    /// 获取子节点的高度（叶子节点固定为 1）
+    pub fn height_if_leaf(&self) -> Option<u8> {
         match self {
-            ChildRef::Internal(id) => Some(id),
-            ChildRef::Leaf { .. } => None,
-        }
-    }
-
-    /// 获取子节点的高度
-    ///
-    /// - 叶子节点：高度 = 1
-    /// - 内部节点：需要从存储中读取（此处返回 None）
-    pub fn height_if_leaf(&self) -> Option<u16> {
-        match self {
-            ChildRef::Leaf { .. } => Some(1),
+            ChildRef::Leaf(_) => Some(1),
             ChildRef::Internal(_) => None,
         }
     }
 }
 
+// ============================================================================
+// PersistentHOTNode
+// ============================================================================
+
+/// HOT 节点的持久化表示
+///
+/// 混合布局策略（v4 设计）：
+/// - `sparse_partial_keys: [u32; 32]` — 固定大小，SIMD 友好
+/// - `children: Vec<ChildRef>` — 紧凑存储，节省空间
+/// - `len()` 从 `children.len()` 推断，无需额外字段
+/// - 索引直接对应：`keys[i] ↔ children[i]`
+///
+/// # 核心约束
+///
+/// - Maximum Span: 32（u32 partial key 的位宽）
+/// - Maximum Fanout: 32（SIMD 友好，4 × AVX2）
+///
+/// # 不变量
+///
+/// 1. `len() <= 32`
+/// 2. `span() <= 32`
+/// 3. `height > 0`
+/// 4. `sparse_partial_keys[0..len()]` 有效，按值升序
+/// 5. `children[i]` 对应 `sparse_partial_keys[i]`（直接索引）
+/// 6. `sparse_partial_keys[len()..32]` 是垃圾数据，不可信任
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistentHOTNode {
+    /// 节点在树中的高度
+    ///
+    /// 定义：h(n) = max(h(children)) + 1
+    /// 叶子节点的 height = 1
+    pub height: u8,
+
+    /// Extraction masks，用于 PEXT 提取 dense partial key
+    ///
+    /// 覆盖 U256 的全部 256 bits：
+    /// - masks[0]: bits 0-63
+    /// - masks[1]: bits 64-127
+    /// - masks[2]: bits 128-191
+    /// - masks[3]: bits 192-255
+    pub extraction_masks: [u64; 4],
+
+    /// Sparse partial keys（固定 32 槽位，SIMD 友好）
+    ///
+    /// 只有 [0..len()] 有效，按值升序排列。
+    /// [len()..32] 是未初始化区域（垃圾数据），由 valid_mask() 过滤。
+    pub sparse_partial_keys: [u32; 32],
+
+    /// Children（紧凑存储）
+    ///
+    /// `children.len()` = 有效 entries 数量。
+    /// `children[i]` 对应 `sparse_partial_keys[i]`（直接索引）。
+    pub children: Vec<ChildRef>,
+}
+
 /// 创建确定性 bincode 配置
-///
-/// 保证：
-/// 1. 固定字节序（little-endian）
-/// 2. 固定整数编码（fixint，不使用变长编码）
-/// 3. 允许尾部字节（兼容性）
-///
-/// 这确保相同的节点内容总是产生相同的字节序列。
 fn bincode_config() -> impl bincode::Options {
     bincode::options()
         .with_little_endian()
@@ -174,96 +315,241 @@ fn bincode_config() -> impl bincode::Options {
 }
 
 impl PersistentHOTNode {
-    /// 创建空节点（仅用于测试）
-    pub fn empty() -> Self {
+    // ========================================================================
+    // 基本访问器
+    // ========================================================================
+
+    /// 有效 entries 数量（从 children.len() 推断）
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.children.len()
+    }
+
+    /// 是否为空
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    /// 是否已满
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.children.len() >= 32
+    }
+
+    /// 用于 SIMD 过滤的 valid mask（动态计算）
+    ///
+    /// 返回连续的低位 1，用于过滤 sparse_partial_keys 尾部垃圾数据
+    #[inline]
+    pub fn valid_mask(&self) -> u32 {
+        let len = self.children.len();
+        if len >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << len) - 1
+        }
+    }
+
+    /// 获取 child（直接索引）
+    #[inline]
+    pub fn get_child(&self, index: usize) -> &ChildRef {
+        debug_assert!(index < self.len());
+        &self.children[index]
+    }
+
+    /// 获取 child（可变引用）
+    #[inline]
+    pub fn get_child_mut(&mut self, index: usize) -> &mut ChildRef {
+        debug_assert!(index < self.len());
+        &mut self.children[index]
+    }
+
+    /// Discriminative bits 数量（span）
+    #[inline]
+    pub fn span(&self) -> u32 {
+        self.extraction_masks.iter().map(|m| m.count_ones()).sum()
+    }
+
+    // ========================================================================
+    // 构造函数
+    // ========================================================================
+
+    /// 创建空节点
+    pub fn empty(height: u8) -> Self {
         Self {
-            height: 1,
-            discriminative_bits: Vec::new(),
-            sparse_partial_keys: Vec::new(),
+            height,
+            extraction_masks: [0; 4],
+            sparse_partial_keys: [0; 32],
             children: Vec::new(),
         }
     }
 
-    /// 创建只包含单个叶子的节点
-    pub fn single_leaf(key: Vec<u8>, value: Vec<u8>) -> Self {
+    /// 创建单叶子节点
+    ///
+    /// 需要传入已存储的叶子的 NodeId
+    pub fn single_leaf(leaf_id: NodeId) -> Self {
         Self {
-            height: 2, // 包含叶子的节点高度为 2
-            discriminative_bits: Vec::new(),
-            sparse_partial_keys: vec![0], // 单个 entry 的 sparse key 为 0
-            children: vec![ChildRef::Leaf { key, value }],
+            height: 1,
+            extraction_masks: [0; 4], // 无 discriminative bits
+            sparse_partial_keys: [0; 32], // sparse key = 0
+            children: vec![ChildRef::Leaf(leaf_id)],
         }
     }
 
-    /// 创建包含两个叶子的节点
+    /// 创建两叶子节点
     ///
-    /// # 参数
-    /// - `discriminative_bit`: 区分两个叶子的 bit 位置
-    /// - `leaf1`, `leaf2`: 两个叶子（按 sparse key 排序后存储）
-    ///
-    /// # 返回
-    /// 新创建的节点
+    /// 需要传入两个已存储的叶子的 NodeId 和它们的 key（用于计算 diff bit）
     pub fn two_leaves(
-        discriminative_bit: u16,
-        key1: Vec<u8>,
-        value1: Vec<u8>,
-        key2: Vec<u8>,
-        value2: Vec<u8>,
+        key1: &[u8; 32],
+        leaf_id1: NodeId,
+        key2: &[u8; 32],
+        leaf_id2: NodeId,
     ) -> Self {
-        // 提取 discriminative bit 的值
-        let bit1 = extract_bit(&key1, discriminative_bit);
-        let bit2 = extract_bit(&key2, discriminative_bit);
+        let diff_bit = find_first_differing_bit(key1, key2).expect("keys must be different");
 
-        // 根据 bit 值决定顺序（bit=0 在前，bit=1 在后）
-        let (sparse_keys, children) = if bit1 <= bit2 {
-            (
-                vec![0, 1], // sparse keys: 0 for left, 1 for right
-                vec![
-                    ChildRef::Leaf {
-                        key: key1,
-                        value: value1,
-                    },
-                    ChildRef::Leaf {
-                        key: key2,
-                        value: value2,
-                    },
-                ],
-            )
+        let bit1 = extract_bit(key1, diff_bit);
+
+        // 确保 bit=0 的在前，保持排序
+        let (id_first, id_second) = if !bit1 {
+            (leaf_id1, leaf_id2)
         } else {
-            (
-                vec![0, 1],
-                vec![
-                    ChildRef::Leaf {
-                        key: key2,
-                        value: value2,
-                    },
-                    ChildRef::Leaf {
-                        key: key1,
-                        value: value1,
-                    },
-                ],
-            )
+            (leaf_id2, leaf_id1)
         };
 
+        let mut sparse_partial_keys = [0u32; 32];
+        sparse_partial_keys[0] = 0; // bit = 0
+        sparse_partial_keys[1] = 1; // bit = 1
+
         Self {
-            height: 2, // 两个叶子的父节点高度为 2
-            discriminative_bits: vec![discriminative_bit],
-            sparse_partial_keys: sparse_keys,
-            children,
+            height: 2,
+            extraction_masks: Self::masks_from_bits(&[diff_bit]),
+            sparse_partial_keys,
+            children: vec![ChildRef::Leaf(id_first), ChildRef::Leaf(id_second)],
         }
     }
 
+    // ========================================================================
+    // Mask 转换
+    // ========================================================================
+
+    /// 从 extraction_masks 反推 discriminative bits
+    ///
+    /// 使用 MSB-first 约定：bit 0 是 key[0] 的 MSB
+    pub fn discriminative_bits(&self) -> Vec<u16> {
+        let mut bits = Vec::with_capacity(32);
+        for (chunk, &mask) in self.extraction_masks.iter().enumerate() {
+            let base = (chunk * 64) as u16;
+            let mut m = mask;
+            while m != 0 {
+                // u64 bit position (0 = LSB, 63 = MSB)
+                let u64_pos = m.trailing_zeros() as u16;
+                // 转换为 key bit position (0 = MSB of byte 0)
+                let key_pos = 63 - u64_pos;
+                bits.push(base + key_pos);
+                m &= m - 1;
+            }
+        }
+        // 按 key bit position 排序
+        bits.sort();
+        bits
+    }
+
+    /// 从 discriminative_bits 构造 extraction_masks
+    ///
+    /// 使用 MSB-first 约定：bit 0 是 key[0] 的 MSB
+    /// 与 from_be_bytes 加载的 u64 配合使用
+    pub fn masks_from_bits(bits: &[u16]) -> [u64; 4] {
+        let mut masks = [0u64; 4];
+        for &bit in bits {
+            let chunk = (bit / 64) as usize;
+            let pos_in_chunk = bit % 64;
+            // 转换：key bit N → u64 bit (63 - N)
+            // 因为 from_be_bytes 使 key[0] 成为 u64 的 MSB
+            masks[chunk] |= 1u64 << (63 - pos_in_chunk);
+        }
+        masks
+    }
+
+    // ========================================================================
+    // Dense Key 提取（4×PEXT）
+    // ========================================================================
+
+    /// 从 U256 key 提取 dense partial key
+    ///
+    /// 使用 4 次 PEXT 操作，每次处理 64 bits
+    #[inline]
+    pub fn extract_dense_partial_key(&self, key: &[u8; 32]) -> u32 {
+        let mut dense_key = 0u32;
+        let mut bit_offset = 0u32;
+
+        for (i, &mask) in self.extraction_masks.iter().enumerate() {
+            if mask == 0 {
+                continue;
+            }
+
+            // 加载对应的 8 字节（big-endian）
+            let start = i * 8;
+            let key_chunk = u64::from_be_bytes(key[start..start + 8].try_into().unwrap());
+
+            // PEXT 提取这部分的 bits
+            let extracted = pext64(key_chunk, mask);
+            let bits_count = mask.count_ones();
+
+            // 合并到 dense_key
+            dense_key |= (extracted as u32) << bit_offset;
+            bit_offset += bits_count;
+        }
+
+        dense_key
+    }
+
+    // ========================================================================
+    // 搜索
+    // ========================================================================
+
+    /// 搜索匹配的 entry
+    ///
+    /// 使用 sparse partial key 匹配逻辑：`(dense & sparse) == sparse`
+    pub fn search(&self, key: &[u8; 32]) -> SearchResult {
+        let dense_key = self.extract_dense_partial_key(key);
+        self.search_with_dense_key(dense_key)
+    }
+
+    /// 使用已计算的 dense key 搜索
+    #[inline]
+    pub fn search_with_dense_key(&self, dense_key: u32) -> SearchResult {
+        let mut last_match: Option<usize> = None;
+
+        for i in 0..self.len() {
+            let sparse_key = self.sparse_partial_keys[i];
+            if (dense_key & sparse_key) == sparse_key {
+                last_match = Some(i);
+            }
+        }
+
+        match last_match {
+            Some(index) => SearchResult::Found { index },
+            None => SearchResult::NotFound { dense_key },
+        }
+    }
+
+    /// 搜索并返回 child
+    pub fn search_child(&self, key: &[u8; 32]) -> Option<&ChildRef> {
+        match self.search(key) {
+            SearchResult::Found { index } => Some(&self.children[index]),
+            SearchResult::NotFound { .. } => None,
+        }
+    }
+
+    // ========================================================================
+    // 序列化
+    // ========================================================================
+
     /// 计算节点的 NodeId（content-addressed）
-    ///
-    /// # 流程
-    /// 1. 使用 bincode 确定性序列化
-    /// 2. 对序列化字节计算哈希
-    /// 3. 返回 32 字节哈希值作为 NodeId
-    ///
-    /// # 类型参数
-    /// - `H`: 实现 `Hasher` trait 的哈希算法（Blake3 或 Keccak256）
-    pub fn compute_node_id<H: Hasher>(&self) -> NodeId {
+    pub fn compute_node_id<H: Hasher>(&self, version: u64) -> NodeId {
         let bytes = self.to_bytes().expect("Serialization should never fail");
-        H::hash(&bytes)
+        let hash = H::hash(&bytes);
+        make_node_id(version, &hash)
     }
 
     /// 序列化为字节（用于存储）
@@ -276,111 +562,36 @@ impl PersistentHOTNode {
         bincode_config().deserialize(bytes)
     }
 
-    /// 验证节点内部一致性
-    ///
-    /// 检查所有不变量是否满足。
+    // ========================================================================
+    // 验证
+    // ========================================================================
+
+    /// 验证节点结构一致性
     pub fn validate(&self) -> Result<(), String> {
-        // 1. 长度一致性
-        if self.sparse_partial_keys.len() != self.children.len() {
-            return Err(format!(
-                "Length mismatch: {} sparse_partial_keys vs {} children",
-                self.sparse_partial_keys.len(),
-                self.children.len()
-            ));
+        // 1. len 范围检查
+        let len = self.len();
+        if len > 32 {
+            return Err(format!("len {} exceeds maximum 32", len));
         }
 
-        // 2. Fanout 限制
-        if self.children.len() > 32 {
-            return Err(format!(
-                "Too many children: {} (max 32)",
-                self.children.len()
-            ));
+        // 2. span 不超过 32
+        let span = self.span();
+        if span > 32 {
+            return Err(format!("span {} exceeds maximum 32", span));
         }
 
-        // 3. Discriminative bits 排序
-        if !self.discriminative_bits.windows(2).all(|w| w[0] < w[1]) {
-            return Err("discriminative_bits not strictly sorted".to_string());
-        }
-
-        // 4. Sparse partial keys 排序（确保序列化确定性）
-        if !self.sparse_partial_keys.windows(2).all(|w| w[0] <= w[1]) {
-            return Err("sparse_partial_keys not sorted".to_string());
-        }
-
-        // 5. Height 合理性
+        // 3. height 合理性
         if self.height == 0 {
-            return Err("Height cannot be 0".to_string());
+            return Err("height cannot be 0".to_string());
         }
 
         Ok(())
     }
-
-    /// 检查节点是否已满（需要分裂）
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        self.children.len() >= 32
-    }
-
-    /// 获取子节点数量
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.children.len()
-    }
-
-    /// 检查是否为空节点
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.children.is_empty()
-    }
-
-    /// 从 key 中提取 dense partial key
-    ///
-    /// Dense partial key 包含所有 discriminative bits 的值，
-    /// 用于在节点中搜索匹配的 child。
-    ///
-    /// # 位提取规则
-    /// bit 位置使用 MSB-first 编码：
-    /// - bit 0 = 第 0 字节的最高位
-    /// - bit 7 = 第 0 字节的最低位
-    /// - bit 8 = 第 1 字节的最高位
-    /// - ...
-    pub fn extract_dense_partial_key(&self, key: &[u8]) -> u32 {
-        let mut partial_key = 0u32;
-        for (i, &bit_pos) in self.discriminative_bits.iter().enumerate() {
-            if extract_bit(key, bit_pos) {
-                partial_key |= 1 << i;
-            }
-        }
-        partial_key
-    }
-
-    /// 在节点中搜索匹配的 child
-    ///
-    /// 使用 sparse partial key 匹配逻辑：`(dense & sparse) == sparse`
-    ///
-    /// 参考论文 Listing 2 和 C++ 实现 (HOTSingleThreadedNodeBase::toResultIndex):
-    /// - SIMD 搜索返回所有匹配项的位掩码
-    /// - 使用 CLZ/BSR 选择最高位索引（即最后一个匹配项）
-    /// - 这确保选择最具体的匹配（sparse key 值最大的）
-    ///
-    /// # 返回
-    /// - `Some(index)`: 找到匹配的 child 索引
-    /// - `None`: 无匹配（理论上不应发生，除非数据损坏）
-    pub fn search(&self, key: &[u8]) -> Option<usize> {
-        let dense_key = self.extract_dense_partial_key(key);
-
-        // 遍历所有条目，返回最后一个匹配项
-        // 这模拟了 C++ 中使用 BSR 找最高位的行为
-        let mut result = None;
-        for (i, &sparse_key) in self.sparse_partial_keys.iter().enumerate() {
-            if (dense_key & sparse_key) == sparse_key {
-                result = Some(i);
-            }
-        }
-
-        result
-    }
 }
+
+// ============================================================================
+// 位操作辅助函数
+// ============================================================================
 
 /// 从字节数组中提取指定位置的 bit
 ///
@@ -418,11 +629,7 @@ pub fn find_first_differing_bit(key1: &[u8], key2: &[u8]) -> Option<u16> {
 
     for i in 0..min_len {
         if key1[i] != key2[i] {
-            // 找到第一个不同的字节
             let xor = key1[i] ^ key2[i];
-            // 找到该字节中第一个不同的 bit（从高位开始，MSB-first）
-            // C++ 使用 __builtin_clz(uint32_t) - 24，因为 clz 操作 32-bit 整数
-            // Rust 的 u8::leading_zeros() 直接返回 0-8，语义等同于 clz(x) - 24
             let bit_in_byte = xor.leading_zeros() as u16;
             return Some((i as u16) * 8 + bit_in_byte);
         }
@@ -430,7 +637,6 @@ pub fn find_first_differing_bit(key1: &[u8], key2: &[u8]) -> Option<u16> {
 
     // 检查长度不同的情况
     if key1.len() != key2.len() {
-        // 较短 key 后面的位视为 0，较长 key 的第一个非零位就是 differing bit
         let longer = if key1.len() > key2.len() { key1 } else { key2 };
         for i in min_len..longer.len() {
             if longer[i] != 0 {
@@ -443,67 +649,150 @@ pub fn find_first_differing_bit(key1: &[u8], key2: &[u8]) -> Option<u16> {
     None
 }
 
+// ============================================================================
+// 测试
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::{Blake3Hasher, Keccak256Hasher};
 
     #[test]
+    fn test_node_id() {
+        let version = 42u64;
+        let hash = [0xABu8; 32];
+        let id = make_node_id(version, &hash);
+
+        assert_eq!(node_id_version(&id), version);
+        assert_eq!(node_id_hash(&id), hash);
+        assert_eq!(id.len(), NODE_ID_SIZE);
+    }
+
+    #[test]
+    fn test_valid_mask() {
+        // len = 0
+        let node = PersistentHOTNode::empty(1);
+        assert_eq!(node.valid_mask(), 0b0);
+
+        // len = 1
+        let node = PersistentHOTNode::single_leaf([0u8; NODE_ID_SIZE]);
+        assert_eq!(node.valid_mask(), 0b1);
+
+        // len = 2
+        let mut key1 = [0u8; 32];
+        let mut key2 = [0u8; 32];
+        key1[0] = 0b0000_0000;
+        key2[0] = 0b0000_0001;
+        let node = PersistentHOTNode::two_leaves(&key1, [1u8; NODE_ID_SIZE], &key2, [2u8; NODE_ID_SIZE]);
+        assert_eq!(node.valid_mask(), 0b11);
+    }
+
+    #[test]
+    fn test_masks_conversion() {
+        // MSB-first 约定：bit N → u64 bit (63 - N % 64)
+        let bits = vec![3, 7, 65, 130];
+        let masks = PersistentHOTNode::masks_from_bits(&bits);
+
+        // bit 3 → u64 bit 60, bit 7 → u64 bit 56
+        assert_eq!(masks[0], (1u64 << 60) | (1u64 << 56));
+        // bit 65 = 64 + 1 → u64 bit 62
+        assert_eq!(masks[1], 1u64 << 62);
+        // bit 130 = 128 + 2 → u64 bit 61
+        assert_eq!(masks[2], 1u64 << 61);
+        assert_eq!(masks[3], 0);
+
+        let node = PersistentHOTNode {
+            extraction_masks: masks,
+            height: 1,
+            sparse_partial_keys: [0; 32],
+            children: Vec::new(),
+        };
+        assert_eq!(node.discriminative_bits(), bits);
+        assert_eq!(node.span(), 4);
+    }
+
+    #[test]
     fn test_extract_bit() {
         // key = [0b10110100, 0b01001011]
-        //        ^^^^^^^^    ^^^^^^^^
-        //        bits 0-7    bits 8-15
         let key = [0b10110100u8, 0b01001011u8];
 
-        // Bit 0 = MSB of byte 0 = 1
-        assert!(extract_bit(&key, 0));
-        // Bit 1 = 0
-        assert!(!extract_bit(&key, 1));
-        // Bit 2 = 1
-        assert!(extract_bit(&key, 2));
-        // Bit 7 = LSB of byte 0 = 0
-        assert!(!extract_bit(&key, 7));
-        // Bit 8 = MSB of byte 1 = 0
-        assert!(!extract_bit(&key, 8));
-        // Bit 9 = 1
-        assert!(extract_bit(&key, 9));
+        assert!(extract_bit(&key, 0)); // MSB of byte 0 = 1
+        assert!(!extract_bit(&key, 1)); // = 0
+        assert!(extract_bit(&key, 2)); // = 1
+        assert!(!extract_bit(&key, 7)); // LSB of byte 0 = 0
+        assert!(!extract_bit(&key, 8)); // MSB of byte 1 = 0
+        assert!(extract_bit(&key, 9)); // = 1
     }
 
     #[test]
     fn test_find_first_differing_bit() {
-        // 相同 key
         assert_eq!(find_first_differing_bit(&[0x12], &[0x12]), None);
 
-        // 第一个 bit 不同
         let key1 = [0b10000000u8];
         let key2 = [0b00000000u8];
         assert_eq!(find_first_differing_bit(&key1, &key2), Some(0));
 
-        // 第 7 个 bit 不同
         let key1 = [0b00000001u8];
         let key2 = [0b00000000u8];
         assert_eq!(find_first_differing_bit(&key1, &key2), Some(7));
 
-        // 第二个字节中的 bit 不同
         let key1 = [0x00, 0b10000000u8];
         let key2 = [0x00, 0b00000000u8];
         assert_eq!(find_first_differing_bit(&key1, &key2), Some(8));
     }
 
     #[test]
+    fn test_search_result() {
+        let found = SearchResult::Found { index: 5 };
+        assert!(found.is_found());
+        assert_eq!(found.found_index(), Some(5));
+
+        let not_found = SearchResult::NotFound { dense_key: 42 };
+        assert!(!not_found.is_found());
+        assert_eq!(not_found.found_index(), None);
+    }
+
+    #[test]
+    fn test_leaf_data() {
+        let key = [0xABu8; 32];
+        let value = b"test value".to_vec();
+        let leaf = LeafData::new(key, value.clone());
+
+        assert_eq!(leaf.key, key);
+        assert_eq!(leaf.value, value);
+
+        // 序列化往返测试
+        let bytes = leaf.to_bytes().unwrap();
+        let decoded = LeafData::from_bytes(&bytes).unwrap();
+        assert_eq!(leaf, decoded);
+    }
+
+    #[test]
+    fn test_child_ref() {
+        let id = [0u8; NODE_ID_SIZE];
+
+        let leaf = ChildRef::Leaf(id);
+        assert!(leaf.is_leaf());
+        assert!(!leaf.is_internal());
+        assert_eq!(leaf.node_id(), &id);
+        assert_eq!(leaf.height_if_leaf(), Some(1));
+
+        let internal = ChildRef::Internal(id);
+        assert!(!internal.is_leaf());
+        assert!(internal.is_internal());
+        assert_eq!(internal.node_id(), &id);
+        assert_eq!(internal.height_if_leaf(), None);
+    }
+
+    #[test]
     fn test_node_serialization_determinism() {
-        let node = PersistentHOTNode {
-            height: 3,
-            discriminative_bits: vec![0, 3, 7, 15],
-            sparse_partial_keys: vec![0b0000, 0b1010],
-            children: vec![
-                ChildRef::Leaf {
-                    key: vec![0x01, 0x02],
-                    value: vec![0xAA, 0xBB],
-                },
-                ChildRef::Internal([0u8; 32]),
-            ],
-        };
+        let mut node = PersistentHOTNode::empty(3);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[0, 3, 7, 15]);
+        node.sparse_partial_keys[0] = 0b0000;
+        node.sparse_partial_keys[1] = 0b1010;
+        node.children.push(ChildRef::Leaf([0xAAu8; NODE_ID_SIZE]));
+        node.children.push(ChildRef::Internal([0xBBu8; NODE_ID_SIZE]));
 
         // 序列化两次应该得到相同字节
         let bytes1 = node.to_bytes().unwrap();
@@ -517,30 +806,30 @@ mod tests {
 
     #[test]
     fn test_compute_node_id_determinism() {
-        let node = PersistentHOTNode {
-            height: 2,
-            discriminative_bits: vec![5],
-            sparse_partial_keys: vec![0, 1],
-            children: vec![
-                ChildRef::Leaf {
-                    key: b"test1".to_vec(),
-                    value: b"value1".to_vec(),
-                },
-                ChildRef::Leaf {
-                    key: b"test2".to_vec(),
-                    value: b"value2".to_vec(),
-                },
-            ],
-        };
+        let mut node = PersistentHOTNode::empty(2);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[5]);
+        node.sparse_partial_keys[0] = 0;
+        node.sparse_partial_keys[1] = 1;
+        node.children.push(ChildRef::Leaf([0x11u8; NODE_ID_SIZE]));
+        node.children.push(ChildRef::Leaf([0x22u8; NODE_ID_SIZE]));
+
+        let version = 100u64;
 
         // 相同节点计算 ID 两次应该相同
-        let id1 = node.compute_node_id::<Blake3Hasher>();
-        let id2 = node.compute_node_id::<Blake3Hasher>();
+        let id1 = node.compute_node_id::<Blake3Hasher>(version);
+        let id2 = node.compute_node_id::<Blake3Hasher>(version);
         assert_eq!(id1, id2, "NodeId should be deterministic");
 
+        // 验证 version 被包含在 ID 中
+        assert_eq!(node_id_version(&id1), version);
+
+        // 不同 version 产生不同 ID
+        let id_v200 = node.compute_node_id::<Blake3Hasher>(200);
+        assert_ne!(id1, id_v200, "Different versions should produce different IDs");
+
         // 不同哈希函数应产生不同 ID
-        let blake3_id = node.compute_node_id::<Blake3Hasher>();
-        let keccak_id = node.compute_node_id::<Keccak256Hasher>();
+        let blake3_id = node.compute_node_id::<Blake3Hasher>(version);
+        let keccak_id = node.compute_node_id::<Keccak256Hasher>(version);
         assert_ne!(
             blake3_id, keccak_id,
             "Different hashers should produce different IDs"
@@ -549,145 +838,136 @@ mod tests {
 
     #[test]
     fn test_validate_valid_node() {
-        let node = PersistentHOTNode {
-            height: 2,
-            discriminative_bits: vec![3, 7],
-            sparse_partial_keys: vec![0, 1],
-            children: vec![
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                },
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                },
-            ],
-        };
+        let mut node = PersistentHOTNode::empty(2);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7]);
+        node.sparse_partial_keys[0] = 0;
+        node.sparse_partial_keys[1] = 1;
+        node.children.push(ChildRef::Leaf([0u8; NODE_ID_SIZE]));
+        node.children.push(ChildRef::Leaf([1u8; NODE_ID_SIZE]));
+
         assert!(node.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_length_mismatch() {
-        let node = PersistentHOTNode {
-            height: 1,
-            discriminative_bits: vec![],
-            sparse_partial_keys: vec![0],
-            children: vec![
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                },
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                },
-            ],
-        };
-        assert!(node.validate().is_err());
-    }
-
-    #[test]
     fn test_validate_too_many_children() {
-        let node = PersistentHOTNode {
-            height: 2,
-            discriminative_bits: vec![],
-            sparse_partial_keys: vec![0; 33],
-            children: vec![
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                };
-                33
-            ],
-        };
+        let mut node = PersistentHOTNode::empty(2);
+        // 添加 33 个 children 超过限制
+        for i in 0..33 {
+            node.children.push(ChildRef::Leaf([i as u8; NODE_ID_SIZE]));
+        }
+
         assert!(node.validate().is_err());
     }
 
     #[test]
-    fn test_validate_unsorted_discriminative_bits() {
-        let node = PersistentHOTNode {
-            height: 2,
-            discriminative_bits: vec![7, 3], // 未排序
-            sparse_partial_keys: vec![0, 1],
-            children: vec![
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                },
-                ChildRef::Leaf {
-                    key: vec![],
-                    value: vec![],
-                },
-            ],
-        };
+    fn test_validate_height_zero() {
+        let mut node = PersistentHOTNode::empty(1);
+        node.height = 0;
+
         assert!(node.validate().is_err());
+    }
+
+    #[test]
+    fn test_two_leaves() {
+        let mut key1 = [0u8; 32];
+        let mut key2 = [0u8; 32];
+        key1[0] = 0b0000_0000; // bit 7 = 0
+        key2[0] = 0b0000_0001; // bit 7 = 1
+
+        // 创建叶子数据
+        let leaf1 = LeafData::new(key1, b"value1".to_vec());
+        let leaf2 = LeafData::new(key2, b"value2".to_vec());
+        let id1 = leaf1.compute_node_id::<Blake3Hasher>(0);
+        let id2 = leaf2.compute_node_id::<Blake3Hasher>(0);
+
+        let node = PersistentHOTNode::two_leaves(&key1, id1, &key2, id2);
+
+        assert_eq!(node.len(), 2);
+        assert_eq!(node.height, 2);
+        assert_eq!(node.span(), 1);
+        assert_eq!(node.sparse_partial_keys[0], 0);
+        assert_eq!(node.sparse_partial_keys[1], 1);
+        assert!(node.validate().is_ok());
     }
 
     #[test]
     fn test_search() {
         // 创建一个简单的两叶子节点
         // discriminative_bit = 3
-        // key1 = 0b0000_0000 (bit 3 = 0) -> sparse_key = 0
-        // key2 = 0b0001_0000 (bit 3 = 1) -> sparse_key = 1
-        let node = PersistentHOTNode {
-            height: 2,
-            discriminative_bits: vec![3],
-            sparse_partial_keys: vec![0, 1],
-            children: vec![
-                ChildRef::Leaf {
-                    key: vec![0b0000_0000],
-                    value: b"value0".to_vec(),
-                },
-                ChildRef::Leaf {
-                    key: vec![0b0001_0000],
-                    value: b"value1".to_vec(),
-                },
-            ],
-        };
+        let mut node = PersistentHOTNode::empty(2);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3]);
+        node.sparse_partial_keys[0] = 0; // bit 3 = 0
+        node.sparse_partial_keys[1] = 1; // bit 3 = 1
+        node.children.push(ChildRef::Leaf([0u8; NODE_ID_SIZE]));
+        node.children.push(ChildRef::Leaf([1u8; NODE_ID_SIZE]));
 
         // 搜索 bit 3 = 0 的 key
-        let search_key = [0b0000_0000u8];
-        assert_eq!(node.search(&search_key), Some(0));
+        let mut search_key = [0u8; 32];
+        search_key[0] = 0b0000_0000; // bit 3 = 0
+        assert_eq!(node.search(&search_key).found_index(), Some(0));
 
         // 搜索 bit 3 = 1 的 key
-        let search_key = [0b0001_0000u8];
-        assert_eq!(node.search(&search_key), Some(1));
+        search_key[0] = 0b0001_0000; // bit 3 = 1
+        assert_eq!(node.search(&search_key).found_index(), Some(1));
     }
 
     #[test]
-    fn test_child_ref_methods() {
-        let leaf = ChildRef::Leaf {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-        };
-        assert!(leaf.is_leaf());
-        assert!(!leaf.is_internal());
-        assert!(leaf.as_leaf().is_some());
-        assert!(leaf.as_internal().is_none());
-        assert_eq!(leaf.height_if_leaf(), Some(1));
+    fn test_search_sparse_matching() {
+        // 测试 sparse 匹配逻辑：(dense & sparse) == sparse
+        //
+        // 模拟一个节点：
+        // discriminative bits: [0, 4]（bit0 在 dense key 的低位，bit4 在高位）
+        //
+        //         bit0
+        //        /    \
+        //     0 /      \ 1
+        //      /        \
+        //   bit4      [Leaf A] sparse=0b01
+        //  /    \
+        // 0      1
+        // [B]   [C]
+        // 0b00  0b10
+        //
+        // HOT 要求 entries 按 key/trie 遍历顺序排列：B, C, A
+        // 这样 sparse 匹配时取最后一个匹配才是正确的
 
-        let internal = ChildRef::Internal([0u8; 32]);
-        assert!(!internal.is_leaf());
-        assert!(internal.is_internal());
-        assert!(internal.as_leaf().is_none());
-        assert!(internal.as_internal().is_some());
-        assert_eq!(internal.height_if_leaf(), None);
+        let mut node = PersistentHOTNode::empty(2);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[0, 4]);
+        // 按 trie 遍历顺序：左子树先于右子树
+        node.sparse_partial_keys[0] = 0b00; // B: bit0=0, bit4=0
+        node.sparse_partial_keys[1] = 0b10; // C: bit0=0, bit4=1
+        node.sparse_partial_keys[2] = 0b01; // A: bit0=1, bit4=don't care
+        node.children.push(ChildRef::Leaf([0u8; NODE_ID_SIZE])); // B
+        node.children.push(ChildRef::Leaf([1u8; NODE_ID_SIZE])); // C
+        node.children.push(ChildRef::Leaf([2u8; NODE_ID_SIZE])); // A
+
+        // dense=0b01 (bit0=1, bit4=0) → 匹配 A（最后一个匹配）
+        assert_eq!(node.search_with_dense_key(0b01).found_index(), Some(2));
+
+        // dense=0b11 (bit0=1, bit4=1) → 匹配 A（bit4 是 don't care，取最后匹配）
+        assert_eq!(node.search_with_dense_key(0b11).found_index(), Some(2));
+
+        // dense=0b00 → 只匹配 B
+        assert_eq!(node.search_with_dense_key(0b00).found_index(), Some(0));
+
+        // dense=0b10 → 匹配 B 和 C，选最后一个 C
+        assert_eq!(node.search_with_dense_key(0b10).found_index(), Some(1));
     }
 
     #[test]
-    fn test_two_leaves_constructor() {
-        let node = PersistentHOTNode::two_leaves(
-            3, // discriminative bit
-            vec![0b0000_0000],
-            b"value0".to_vec(),
-            vec![0b0001_0000],
-            b"value1".to_vec(),
-        );
+    fn test_extract_dense_partial_key() {
+        // 测试 4×PEXT
+        let bits = vec![7, 65]; // bit 7 在 chunk 0，bit 65 在 chunk 1
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&bits);
 
-        assert_eq!(node.height, 2);
-        assert_eq!(node.discriminative_bits, vec![3]);
-        assert_eq!(node.children.len(), 2);
-        assert!(node.validate().is_ok());
+        let mut key = [0u8; 32];
+        // bit 7 在 byte 0 的 LSB 位置
+        key[0] = 0b0000_0001; // bit 7 = 1
+        // bit 65 在 byte 8 的 bit 6 位置 (65 = 64 + 1, 在 chunk 1 的 bit 1)
+        key[8] = 0b0100_0000; // bit 65 = 1
+
+        let dense = node.extract_dense_partial_key(&key);
+        assert_eq!(dense, 0b11); // 两个 bit 都是 1
     }
 }
