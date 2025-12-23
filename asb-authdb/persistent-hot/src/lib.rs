@@ -28,6 +28,7 @@ pub mod hash;
 pub mod node;
 pub mod simd;
 pub mod store;
+pub mod tree;
 
 // bits.rs 导出
 pub use bits::{
@@ -53,3 +54,6 @@ pub use store::{MemoryNodeStore, NodeStore, Result as StoreResult, StoreError};
 // kvdb-backend feature 启用时导出 KvNodeStore
 #[cfg(feature = "kvdb-backend")]
 pub use store::KvNodeStore;
+
+// tree.rs 导出
+pub use tree::HOTTree;
