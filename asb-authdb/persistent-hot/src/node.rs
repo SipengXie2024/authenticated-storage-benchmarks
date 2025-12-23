@@ -17,7 +17,7 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use crate::bits::pext64;
+use crate::bits::{pext32, pext64};
 use crate::hash::Hasher;
 use crate::simd::{simd_search, SimdSearchResult};
 
@@ -253,6 +253,82 @@ impl ChildRef {
 }
 
 // ============================================================================
+// BiNode
+// ============================================================================
+
+/// Split 操作的结果
+///
+/// 表示将一个满节点分裂为两个子节点的结果。
+/// BiNode 持有已存储子节点的 NodeId（Copy-on-Write 模式）。
+///
+/// # 字段
+///
+/// - `discriminative_bit`: 分裂点的 bit 位置（MSB）
+/// - `left`: 左子树 NodeId（该 bit = 0）
+/// - `right`: 右子树 NodeId（该 bit = 1）
+/// - `height`: 子树的高度（继承自原节点）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiNode {
+    /// 分裂 bit 的绝对位置（0-255）
+    pub discriminative_bit: u16,
+    /// 左子树（bit = 0），已存储
+    pub left: NodeId,
+    /// 右子树（bit = 1），已存储
+    pub right: NodeId,
+    /// 子树高度
+    pub height: u8,
+}
+
+impl BiNode {
+    /// 从两个已有值创建 BiNode
+    ///
+    /// 根据 key 中 discriminative_bit 的值决定左右位置
+    pub fn from_existing_and_new(
+        discriminative_bit: u16,
+        existing_key: &[u8; 32],
+        existing_id: NodeId,
+        new_id: NodeId,
+        height: u8,
+    ) -> Self {
+        let existing_bit = extract_bit(existing_key, discriminative_bit);
+        if existing_bit {
+            // existing 的 bit = 1，放右边
+            BiNode {
+                discriminative_bit,
+                left: new_id,
+                right: existing_id,
+                height,
+            }
+        } else {
+            // existing 的 bit = 0，放左边
+            BiNode {
+                discriminative_bit,
+                left: existing_id,
+                right: new_id,
+                height,
+            }
+        }
+    }
+
+    /// 创建包含两个叶子的节点
+    ///
+    /// 根据 BiNode 信息创建一个新的 PersistentHOTNode
+    pub fn to_two_entry_node(&self) -> PersistentHOTNode {
+        let mut node = PersistentHOTNode::empty(self.height + 1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[self.discriminative_bit]);
+        // left (bit=0) 放前面，sparse_key = 0
+        // right (bit=1) 放后面，sparse_key = 1
+        node.sparse_partial_keys[0] = 0;
+        node.sparse_partial_keys[1] = 1;
+        node.children = vec![
+            ChildRef::Internal(self.left.clone()),
+            ChildRef::Internal(self.right.clone()),
+        ];
+        node
+    }
+}
+
+// ============================================================================
 // PersistentHOTNode
 // ============================================================================
 
@@ -372,6 +448,124 @@ impl PersistentHOTNode {
     }
 
     // ========================================================================
+    // Bitmask 风格操作（对齐 C++ HOT 实现）
+    // ========================================================================
+
+    /// 返回最小的 discriminative bit index（用于 Split 分区）
+    ///
+    /// 对应 C++ 的 `mMostSignificantDiscriminativeBitIndex`。
+    /// 注意：C++ 称之为 "most significant" 是因为它在 trie 中最先被检查，
+    /// 而不是因为它在数值上最大。
+    ///
+    /// # 返回
+    /// - `Some(bit_index)`: 最小的 key bit index
+    /// - `None`: 节点没有 discriminative bits
+    #[inline]
+    pub fn first_discriminative_bit(&self) -> Option<u16> {
+        for (chunk, &mask) in self.extraction_masks.iter().enumerate() {
+            if mask != 0 {
+                // mask 中最高的 u64 bit 对应最小的 key bit
+                // 因为 key bit N → u64 bit (63 - N%64)
+                let u64_msb = 63 - mask.leading_zeros() as u16;
+                let key_bit_in_chunk = 63 - u64_msb;
+                return Some((chunk as u16) * 64 + key_bit_in_chunk);
+            }
+        }
+        None
+    }
+
+    /// 返回所有有效 bits 的 mask（连续的低位 1）
+    ///
+    /// 对应 C++ 的 `getAllMaskBits()`。
+    /// 用于 PDEP/PEXT 的 conversion mask 计算。
+    ///
+    /// # 示例
+    /// - span = 3 → 返回 0b111
+    /// - span = 5 → 返回 0b11111
+    #[inline]
+    pub fn get_all_mask_bits(&self) -> u32 {
+        let span = self.span();
+        if span >= 32 {
+            u32::MAX
+        } else if span == 0 {
+            0
+        } else {
+            (1u32 << span) - 1
+        }
+    }
+
+    /// 获取某个 key bit 在 sparse key 中对应的 mask
+    ///
+    /// 对应 C++ 的 `getMaskFor(DiscriminativeBit)`。
+    /// 返回只有一个 bit 为 1 的 mask，表示该 key bit 在 sparse key 中的位置。
+    ///
+    /// # 参数
+    /// - `bit`: key bit index (0-255)
+    ///
+    /// # 返回
+    /// - 如果该 bit 是 discriminative bit，返回对应的 mask
+    /// - 如果该 bit 不是 discriminative bit，返回 0
+    ///
+    /// # 实现
+    /// 构造只有目标 bit 的虚拟 key chunk，然后用 PEXT 提取。
+    #[inline]
+    pub fn get_mask_for_bit(&self, bit: u16) -> u32 {
+        let chunk = (bit / 64) as usize;
+        let bit_in_chunk = bit % 64;
+        let u64_bit_pos = 63 - bit_in_chunk; // MSB-first 转换
+
+        if chunk >= 4 {
+            return 0;
+        }
+
+        let mask = self.extraction_masks[chunk];
+        let single_bit = 1u64 << u64_bit_pos;
+
+        // 检查该 bit 是否在 mask 中
+        if (mask & single_bit) == 0 {
+            return 0;
+        }
+
+        // 使用 PEXT 计算该 bit 在 sparse key 中的位置
+        // 先计算之前所有 chunks 贡献的 bits 数量
+        let offset: u32 = self.extraction_masks[..chunk]
+            .iter()
+            .map(|m| m.count_ones())
+            .sum();
+
+        // 在当前 chunk 中，该 bit 之前（更低 u64 bit position）有多少个 1
+        let lower_mask = single_bit - 1; // 比 single_bit 更低的所有位
+        let bits_before = (mask & lower_mask).count_ones();
+
+        1u32 << (offset + bits_before)
+    }
+
+    /// 获取 Split 分区用的 root mask
+    ///
+    /// 返回最小 discriminative bit 对应的 sparse key mask。
+    ///
+    /// **注意**：由于 PEXT 按 chunk 顺序处理，最小 key bit 不一定对应
+    /// sparse key 的最高位。必须通过 `get_mask_for_bit` 计算实际位置。
+    #[inline]
+    pub fn get_root_mask(&self) -> u32 {
+        match self.first_discriminative_bit() {
+            Some(bit) => self.get_mask_for_bit(bit),
+            None => 0,
+        }
+    }
+
+    /// 找到 sparse key 应该插入的位置（保持升序）
+    ///
+    /// 使用 SIMD 优化（AVX2 可用时）
+    pub fn find_insert_position(&self, sparse_key: u32) -> usize {
+        crate::simd::simd_find_insert_position(
+            &self.sparse_partial_keys,
+            sparse_key,
+            self.len() as u8,
+        )
+    }
+
+    // ========================================================================
     // 构造函数
     // ========================================================================
 
@@ -472,6 +666,101 @@ impl PersistentHOTNode {
     }
 
     // ========================================================================
+    // Insert 操作（Copy-on-Write）
+    // ========================================================================
+
+    /// Normal Insert: 添加新 entry，返回新节点
+    ///
+    /// 遵循 Copy-on-Write 原则：不修改 self，返回新节点。
+    ///
+    /// # 参数
+    /// - `new_bit`: 新的 discriminative bit 位置（0-255）
+    /// - `new_bit_value`: 新 key 在该 bit 位置的值（true=1, false=0）
+    /// - `affected_index`: 受影响的 entry index（与新 key 共享前缀）
+    /// - `child`: 新的 ChildRef（叶子或内部节点）
+    ///
+    /// # Panics
+    /// - 如果节点已满（debug 模式）
+    pub fn with_new_entry(
+        &self,
+        new_bit: u16,
+        new_bit_value: bool,
+        affected_index: usize,
+        child: ChildRef,
+    ) -> Self {
+        debug_assert!(!self.is_full(), "Cannot add entry to full node");
+        debug_assert!(affected_index < self.len(), "affected_index out of bounds");
+
+        // 创建副本
+        let mut new_node = self.clone();
+
+        // Step 1: 检查是否需要添加新的 discriminative bit
+        let bit_chunk = (new_bit / 64) as usize;
+        let bit_in_chunk = new_bit % 64;
+        let u64_bit_pos = 63 - bit_in_chunk; // MSB-first 转换
+        let bit_mask = 1u64 << u64_bit_pos;
+        let is_new_bit = (new_node.extraction_masks[bit_chunk] & bit_mask) == 0;
+
+        // Step 2: 如果是新 bit，更新 extraction_masks 并重编码 sparse keys
+        let new_bit_mask: u32 = if is_new_bit {
+            // 先添加到 extraction_masks（这样 get_mask_for_bit 才能工作）
+            new_node.extraction_masks[bit_chunk] |= bit_mask;
+
+            // 获取新 bit 在 sparse key 中的 mask
+            let new_bit_mask = new_node.get_mask_for_bit(new_bit);
+
+            // 基于 mask 计算 PDEP deposit mask（替代 compute_deposit_mask）
+            // deposit_mask 的作用：在 new_bit_mask 位置留一个 0，其余保持
+            let old_all_bits = self.get_all_mask_bits();
+            let low_mask = new_bit_mask - 1; // new_bit_mask 之前的位
+            let high_mask = old_all_bits & !low_mask; // new_bit_mask 及之后的位
+            let deposit_mask = (high_mask << 1) | low_mask;
+
+            // 使用 PDEP 重编码所有现有 sparse keys
+            for i in 0..new_node.len() {
+                new_node.sparse_partial_keys[i] =
+                    crate::bits::pdep32(new_node.sparse_partial_keys[i], deposit_mask);
+            }
+
+            new_bit_mask
+        } else {
+            // bit 已存在，直接获取其 mask
+            new_node.get_mask_for_bit(new_bit)
+        };
+
+        // Step 3: 计算新 entry 的 sparse partial key
+        let affected_sparse = new_node.sparse_partial_keys[affected_index];
+        let new_sparse_key = if new_bit_value {
+            affected_sparse | new_bit_mask
+        } else {
+            affected_sparse & !new_bit_mask
+        };
+
+        // Step 4: 如果是新 bit，更新 affected entry 的 sparse key
+        if is_new_bit && !new_bit_value {
+            // 新 key 的 bit=0，则 affected entry 的 bit=1
+            new_node.sparse_partial_keys[affected_index] |= new_bit_mask;
+        }
+        // 注：如果 new_bit_value=true，affected entry 保持 bit=0（PDEP 已填充 0）
+
+        // Step 5: 找到插入位置（保持 sparse keys 升序）
+        let insert_pos = new_node.find_insert_position(new_sparse_key);
+
+        // Step 6: 插入新 entry
+        // 6a. 移动 sparse_partial_keys（固定数组，手动移动）
+        let old_len = new_node.len();
+        for i in (insert_pos..old_len).rev() {
+            new_node.sparse_partial_keys[i + 1] = new_node.sparse_partial_keys[i];
+        }
+        new_node.sparse_partial_keys[insert_pos] = new_sparse_key;
+
+        // 6b. 插入 child（Vec::insert 自动处理）
+        new_node.children.insert(insert_pos, child);
+
+        new_node
+    }
+
+    // ========================================================================
     // Dense Key 提取（4×PEXT）
     // ========================================================================
 
@@ -531,6 +820,115 @@ impl PersistentHOTNode {
             SearchResult::Found { index } => Some(&self.children[index]),
             SearchResult::NotFound { .. } => None,
         }
+    }
+
+    // ========================================================================
+    // Split 操作
+    // ========================================================================
+
+    /// 获取 root bit = 1 的 entries 掩码
+    ///
+    /// 返回 u32 位掩码，每一位表示对应 entry 的 root bit 是否为 1
+    fn get_mask_for_larger_entries(&self) -> u32 {
+        let root_mask = self.get_root_mask();
+        if root_mask == 0 {
+            return 0;
+        }
+
+        let mut result = 0u32;
+        for i in 0..self.len() {
+            if (self.sparse_partial_keys[i] & root_mask) != 0 {
+                result |= 1 << i;
+            }
+        }
+        result
+    }
+
+    /// 分裂节点
+    ///
+    /// 按 first_discriminative_bit 将节点分成两组：
+    /// - left: root bit = 0 的 entries
+    /// - right: root bit = 1 的 entries
+    ///
+    /// 返回 (discriminative_bit, left_node, right_node)
+    ///
+    /// # Panics
+    ///
+    /// 如果节点 span = 0（无法分裂）
+    pub fn split(&self) -> (u16, PersistentHOTNode, PersistentHOTNode) {
+        let disc_bit = self
+            .first_discriminative_bit()
+            .expect("Cannot split node with span=0");
+        let root_mask = self.get_root_mask();
+
+        // 收集两组 entries
+        let mut left_indices = Vec::new();
+        let mut right_indices = Vec::new();
+
+        for i in 0..self.len() {
+            if (self.sparse_partial_keys[i] & root_mask) == 0 {
+                left_indices.push(i);
+            } else {
+                right_indices.push(i);
+            }
+        }
+
+        // 创建压缩后的子节点
+        let left_node = self.compress_entries(&left_indices, disc_bit);
+        let right_node = self.compress_entries(&right_indices, disc_bit);
+
+        (disc_bit, left_node, right_node)
+    }
+
+    /// 压缩指定 entries 到新节点
+    ///
+    /// 移除 root_bit 对应的 discriminative bit，重新编码 sparse keys
+    fn compress_entries(&self, indices: &[usize], removed_bit: u16) -> PersistentHOTNode {
+        if indices.is_empty() {
+            return PersistentHOTNode::empty(self.height);
+        }
+
+        // 单个 entry 直接返回（但这在 HOT 中不应该发生在 split 时）
+        if indices.len() == 1 {
+            let idx = indices[0];
+            let mut node = PersistentHOTNode::empty(self.height);
+            // 只有一个 entry，无 discriminative bits
+            node.children.push(self.children[idx].clone());
+            return node;
+        }
+
+        // 计算新的 extraction_masks（移除 removed_bit）
+        let chunk = (removed_bit / 64) as usize;
+        let bit_in_chunk = removed_bit % 64;
+        let u64_bit_pos = 63 - bit_in_chunk;
+        let bit_to_remove = 1u64 << u64_bit_pos;
+
+        let mut new_masks = self.extraction_masks;
+        new_masks[chunk] &= !bit_to_remove;
+
+        // 计算 compression mask（用于 PEXT 重编码 sparse keys）
+        // compression_mask = 移除 root_mask 对应位后的所有位
+        let root_sparse_mask = self.get_mask_for_bit(removed_bit);
+        let all_bits = self.get_all_mask_bits();
+        let compression_mask = all_bits & !root_sparse_mask;
+
+        // 构建新节点
+        let mut new_node = PersistentHOTNode {
+            height: self.height,
+            extraction_masks: new_masks,
+            sparse_partial_keys: [0; 32],
+            children: Vec::with_capacity(indices.len()),
+        };
+
+        for (new_idx, &old_idx) in indices.iter().enumerate() {
+            // PEXT 重编码 sparse key
+            let old_sparse = self.sparse_partial_keys[old_idx];
+            let new_sparse = pext32(old_sparse, compression_mask);
+            new_node.sparse_partial_keys[new_idx] = new_sparse;
+            new_node.children.push(self.children[old_idx].clone());
+        }
+
+        new_node
     }
 
     // ========================================================================
@@ -961,5 +1359,251 @@ mod tests {
 
         let dense = node.extract_dense_partial_key(&key);
         assert_eq!(dense, 0b11); // 两个 bit 都是 1
+    }
+
+    // ========================================================================
+    // Bitmask 风格函数测试
+    // ========================================================================
+
+    #[test]
+    fn test_first_discriminative_bit() {
+        // 空节点
+        let node = PersistentHOTNode::empty(1);
+        assert_eq!(node.first_discriminative_bit(), None);
+
+        // 单 bit: key bit 3
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3]);
+        assert_eq!(node.first_discriminative_bit(), Some(3));
+
+        // 多个 bits: [3, 7, 100]，应返回最小的 3
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7, 100]);
+        assert_eq!(node.first_discriminative_bit(), Some(3));
+
+        // 跨 chunk: [65, 130]，应返回 65
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[65, 130]);
+        assert_eq!(node.first_discriminative_bit(), Some(65));
+
+        // 只在 chunk 2: [128, 130]
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[128, 130]);
+        assert_eq!(node.first_discriminative_bit(), Some(128));
+    }
+
+    #[test]
+    fn test_get_all_mask_bits() {
+        // span = 0
+        let node = PersistentHOTNode::empty(1);
+        assert_eq!(node.get_all_mask_bits(), 0);
+
+        // span = 1
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[5]);
+        assert_eq!(node.get_all_mask_bits(), 0b1);
+
+        // span = 3
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7, 100]);
+        assert_eq!(node.get_all_mask_bits(), 0b111);
+
+        // span = 5
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[0, 1, 2, 3, 4]);
+        assert_eq!(node.get_all_mask_bits(), 0b11111);
+    }
+
+    #[test]
+    fn test_get_mask_for_bit() {
+        // 单 bit: key bit 3 → sparse key bit 0
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3]);
+        assert_eq!(node.get_mask_for_bit(3), 0b1);
+        assert_eq!(node.get_mask_for_bit(5), 0); // 不是 discriminative bit
+
+        // 两个 bits 在同一 chunk: [3, 7]
+        // PEXT 从 u64 LSB 开始提取，较大 key bit → 较低 u64 bit → 先提取
+        // key bit 7 → u64 bit 56 → sparse key bit 0
+        // key bit 3 → u64 bit 60 → sparse key bit 1
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7]);
+        assert_eq!(node.get_mask_for_bit(7), 0b01); // bit 0
+        assert_eq!(node.get_mask_for_bit(3), 0b10); // bit 1
+        assert_eq!(node.get_mask_for_bit(5), 0);    // 不存在
+
+        // 三个 bits 跨 chunk: [3, 7, 100]
+        // 同 chunk 内：较大 key bit → 较低 sparse bit
+        // 跨 chunk：较小 chunk → 较低 sparse bits
+        //
+        // chunk 0 (bits 3, 7): 7 → sparse bit 0, 3 → sparse bit 1
+        // chunk 1 (bit 100): 100 → sparse bit 2
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7, 100]);
+        assert_eq!(node.get_mask_for_bit(7), 0b001);   // sparse bit 0
+        assert_eq!(node.get_mask_for_bit(3), 0b010);   // sparse bit 1
+        assert_eq!(node.get_mask_for_bit(100), 0b100); // sparse bit 2
+    }
+
+    #[test]
+    fn test_get_root_mask() {
+        // span = 0
+        let node = PersistentHOTNode::empty(1);
+        assert_eq!(node.get_root_mask(), 0);
+
+        // span = 1
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[5]);
+        assert_eq!(node.get_root_mask(), 0b1);
+
+        // 同 chunk 两个 bits: [3, 7]
+        // first_discriminative_bit = 3 → get_mask_for_bit(3) = 0b10
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7]);
+        assert_eq!(node.first_discriminative_bit(), Some(3));
+        assert_eq!(node.get_root_mask(), 0b10); // NOT 1 << (2-1) = 2
+
+        // 跨 chunk: [3, 7, 100]
+        // first_discriminative_bit = 3 → get_mask_for_bit(3) = 0b010
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7, 100]);
+        assert_eq!(node.first_discriminative_bit(), Some(3));
+        assert_eq!(node.get_root_mask(), 0b010); // NOT 1 << (3-1) = 4
+
+        // 验证 root_mask == get_mask_for_bit(first_discriminative_bit)
+        let first_bit = node.first_discriminative_bit().unwrap();
+        assert_eq!(node.get_root_mask(), node.get_mask_for_bit(first_bit));
+
+        // 不同 chunk，无共享 byte: [3, 100]
+        // first_discriminative_bit = 3 → get_mask_for_bit(3) = 0b01
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 100]);
+        assert_eq!(node.first_discriminative_bit(), Some(3));
+        assert_eq!(node.get_root_mask(), 0b01); // sparse bit 0
+    }
+
+    #[test]
+    fn test_bitmask_consistency_with_pext() {
+        // 验证 get_mask_for_bit 与实际 PEXT 结果一致
+        use crate::bits::pext64;
+
+        let bits = vec![3, 7, 100];
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&bits);
+
+        // 构造只有 key bit 3 = 1 的 key
+        let mut key = [0u8; 32];
+        key[0] = 0b0001_0000; // bit 3 = 1
+
+        let dense = node.extract_dense_partial_key(&key);
+        let mask_for_bit3 = node.get_mask_for_bit(3);
+
+        // dense 应该只有 bit 3 对应的位为 1
+        assert_eq!(dense, mask_for_bit3);
+
+        // 构造只有 key bit 100 = 1 的 key
+        let mut key = [0u8; 32];
+        key[12] = 0b0000_1000; // bit 100 = byte 12, bit 4 in byte
+
+        let dense = node.extract_dense_partial_key(&key);
+        let mask_for_bit100 = node.get_mask_for_bit(100);
+
+        assert_eq!(dense, mask_for_bit100);
+    }
+
+    // ========================================================================
+    // Split 测试
+    // ========================================================================
+
+    #[test]
+    fn test_split_basic() {
+        // 创建包含 4 个 entries 的节点
+        // discriminative bits: [3, 7]
+        // sparse keys: 0b00, 0b01, 0b10, 0b11
+        // first_discriminative_bit = 3 → root_mask = 0b10
+        //
+        // 分裂后：
+        // - left (root bit = 0): entries 0, 1 (sparse keys 0b00, 0b01)
+        // - right (root bit = 1): entries 2, 3 (sparse keys 0b10, 0b11)
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7]);
+        node.sparse_partial_keys[0] = 0b00;
+        node.sparse_partial_keys[1] = 0b01;
+        node.sparse_partial_keys[2] = 0b10;
+        node.sparse_partial_keys[3] = 0b11;
+        node.children = vec![
+            ChildRef::Leaf(make_node_id(1, &[1; 32])),
+            ChildRef::Leaf(make_node_id(1, &[2; 32])),
+            ChildRef::Leaf(make_node_id(1, &[3; 32])),
+            ChildRef::Leaf(make_node_id(1, &[4; 32])),
+        ];
+
+        let (disc_bit, left, right) = node.split();
+
+        // 验证分裂 bit
+        assert_eq!(disc_bit, 3); // first_discriminative_bit
+
+        // 验证 left 节点
+        assert_eq!(left.len(), 2);
+        assert_eq!(left.span(), 1); // 只剩 bit 7
+        assert_eq!(left.sparse_partial_keys[0], 0b0); // 压缩后的 0b00
+        assert_eq!(left.sparse_partial_keys[1], 0b1); // 压缩后的 0b01
+        assert_eq!(left.children[0], ChildRef::Leaf(make_node_id(1, &[1; 32])));
+        assert_eq!(left.children[1], ChildRef::Leaf(make_node_id(1, &[2; 32])));
+
+        // 验证 right 节点
+        assert_eq!(right.len(), 2);
+        assert_eq!(right.span(), 1); // 只剩 bit 7
+        assert_eq!(right.sparse_partial_keys[0], 0b0); // 压缩后的 0b10 → 0b0
+        assert_eq!(right.sparse_partial_keys[1], 0b1); // 压缩后的 0b11 → 0b1
+        assert_eq!(right.children[0], ChildRef::Leaf(make_node_id(1, &[3; 32])));
+        assert_eq!(right.children[1], ChildRef::Leaf(make_node_id(1, &[4; 32])));
+    }
+
+    #[test]
+    fn test_split_unbalanced() {
+        // 创建不均匀分布的节点
+        // sparse keys: 0b00, 0b01, 0b10
+        // root_mask = 0b10 → left 有 2 个，right 有 1 个
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7]);
+        node.sparse_partial_keys[0] = 0b00;
+        node.sparse_partial_keys[1] = 0b01;
+        node.sparse_partial_keys[2] = 0b10;
+        node.children = vec![
+            ChildRef::Leaf(make_node_id(1, &[1; 32])),
+            ChildRef::Leaf(make_node_id(1, &[2; 32])),
+            ChildRef::Leaf(make_node_id(1, &[3; 32])),
+        ];
+
+        let (disc_bit, left, right) = node.split();
+
+        assert_eq!(disc_bit, 3);
+        assert_eq!(left.len(), 2);
+        assert_eq!(right.len(), 1);
+
+        // right 只有一个 entry，无 discriminative bits
+        assert_eq!(right.span(), 0);
+    }
+
+    #[test]
+    fn test_get_mask_for_larger_entries() {
+        let mut node = PersistentHOTNode::empty(1);
+        node.extraction_masks = PersistentHOTNode::masks_from_bits(&[3, 7]);
+        node.sparse_partial_keys[0] = 0b00;
+        node.sparse_partial_keys[1] = 0b01;
+        node.sparse_partial_keys[2] = 0b10;
+        node.sparse_partial_keys[3] = 0b11;
+        node.children = vec![
+            ChildRef::Leaf(make_node_id(1, &[1; 32])),
+            ChildRef::Leaf(make_node_id(1, &[2; 32])),
+            ChildRef::Leaf(make_node_id(1, &[3; 32])),
+            ChildRef::Leaf(make_node_id(1, &[4; 32])),
+        ];
+
+        // root_mask = 0b10
+        // entries 2 和 3 的 root bit = 1
+        let mask = node.get_mask_for_larger_entries();
+        assert_eq!(mask, 0b1100); // bit 2 和 3 为 1
     }
 }

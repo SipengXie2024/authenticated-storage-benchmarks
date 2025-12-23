@@ -6,7 +6,9 @@
 use std::marker::PhantomData;
 
 use crate::hash::{Blake3Hasher, Hasher};
-use crate::node::{ChildRef, NodeId, SearchResult};
+use crate::node::{
+    find_first_differing_bit, BiNode, ChildRef, LeafData, NodeId, PersistentHOTNode, SearchResult,
+};
 use crate::store::{NodeStore, Result, StoreError};
 
 /// Height Optimized Trie
@@ -118,6 +120,337 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     pub fn is_empty(&self) -> bool {
         self.root_id.is_none()
     }
+
+    // ========================================================================
+    // Insert 操作
+    // ========================================================================
+
+    /// 插入 key-value 对
+    ///
+    /// # 参数
+    ///
+    /// - `key`: 32 字节的 key
+    /// - `value`: 任意长度的 value
+    /// - `version`: 版本号（用于生成 NodeId）
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(())`: 插入成功
+    /// - `Err(_)`: 存储错误
+    pub fn insert(&mut self, key: &[u8; 32], value: Vec<u8>, version: u64) -> Result<()> {
+        // 创建并存储叶子
+        let leaf = LeafData {
+            key: *key,
+            value,
+        };
+        let leaf_id = leaf.compute_node_id::<H>(version);
+        self.store.put_leaf(&leaf_id, &leaf)?;
+
+        match &self.root_id {
+            None => {
+                // 空树：创建单叶子节点作为根
+                let node = PersistentHOTNode::single_leaf(leaf_id);
+                let node_id = node.compute_node_id::<H>(version);
+                self.store.put_node(&node_id, &node)?;
+                self.root_id = Some(node_id);
+                Ok(())
+            }
+            Some(root_id) => {
+                // 非空树：递归插入
+                let new_root_id = self.insert_internal(root_id.clone(), key, leaf_id, version)?;
+                self.root_id = Some(new_root_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// 递归插入到节点
+    ///
+    /// 返回新的节点 ID（可能是修改后的当前节点，或新创建的父节点）
+    fn insert_internal(
+        &mut self,
+        node_id: NodeId,
+        key: &[u8; 32],
+        leaf_id: NodeId,
+        version: u64,
+    ) -> Result<NodeId> {
+        let node = self
+            .store
+            .get_node(&node_id)?
+            .ok_or(StoreError::NotFound)?;
+
+        match node.search(key) {
+            SearchResult::Found { index } => {
+                // 找到匹配的 entry
+                match &node.children[index] {
+                    ChildRef::Internal(child_id) => {
+                        // 递归插入到子节点
+                        let new_child_id =
+                            self.insert_internal(child_id.clone(), key, leaf_id, version)?;
+
+                        // 更新当前节点的 child 引用
+                        let mut new_node = node.clone();
+                        new_node.children[index] = ChildRef::Internal(new_child_id);
+                        let new_node_id = new_node.compute_node_id::<H>(version);
+                        self.store.put_node(&new_node_id, &new_node)?;
+                        Ok(new_node_id)
+                    }
+                    ChildRef::Leaf(existing_leaf_id) => {
+                        // 叶子节点：需要处理碰撞
+                        let existing_leaf = self
+                            .store
+                            .get_leaf(existing_leaf_id)?
+                            .ok_or(StoreError::NotFound)?;
+
+                        if &existing_leaf.key == key {
+                            // 相同 key：替换值（更新 leaf）
+                            let mut new_node = node.clone();
+                            new_node.children[index] = ChildRef::Leaf(leaf_id);
+                            let new_node_id = new_node.compute_node_id::<H>(version);
+                            self.store.put_node(&new_node_id, &new_node)?;
+                            Ok(new_node_id)
+                        } else {
+                            // 不同 key：Leaf Node Pushdown
+                            self.leaf_pushdown(
+                                &node,
+                                index,
+                                &existing_leaf.key,
+                                existing_leaf_id.clone(),
+                                key,
+                                leaf_id,
+                                version,
+                            )
+                        }
+                    }
+                }
+            }
+            SearchResult::NotFound { dense_key } => {
+                // 没有匹配的 entry：需要添加新 entry
+                self.add_entry_to_node(&node, key, dense_key, leaf_id, version)
+            }
+        }
+    }
+
+    /// Leaf Node Pushdown: 创建新节点容纳两个叶子
+    fn leaf_pushdown(
+        &mut self,
+        parent_node: &PersistentHOTNode,
+        affected_index: usize,
+        existing_key: &[u8; 32],
+        existing_leaf_id: NodeId,
+        new_key: &[u8; 32],
+        new_leaf_id: NodeId,
+        version: u64,
+    ) -> Result<NodeId> {
+        // 找到两个 key 的第一个不同 bit
+        let diff_bit = find_first_differing_bit(existing_key, new_key)
+            .expect("Keys must be different");
+
+        // 创建包含两个叶子的新节点
+        let new_child = PersistentHOTNode::two_leaves(
+            existing_key,
+            existing_leaf_id,
+            new_key,
+            new_leaf_id,
+        );
+        let new_child_id = new_child.compute_node_id::<H>(version);
+        self.store.put_node(&new_child_id, &new_child)?;
+
+        // 更新父节点：将叶子替换为内部节点
+        let mut new_parent = parent_node.clone();
+        new_parent.children[affected_index] = ChildRef::Internal(new_child_id);
+        let new_parent_id = new_parent.compute_node_id::<H>(version);
+        self.store.put_node(&new_parent_id, &new_parent)?;
+
+        Ok(new_parent_id)
+    }
+
+    /// 向节点添加新 entry
+    fn add_entry_to_node(
+        &mut self,
+        node: &PersistentHOTNode,
+        key: &[u8; 32],
+        dense_key: u32,
+        leaf_id: NodeId,
+        version: u64,
+    ) -> Result<NodeId> {
+        // 检查节点是否已满
+        if node.len() >= 32 {
+            // 节点溢出：需要 Split
+            return self.handle_overflow(node, key, dense_key, leaf_id, version);
+        }
+
+        // 找到 affected entry（用于确定 diff bit）
+        // 使用 sparse matching 找到最后一个匹配的 entry
+        let affected_index = self.find_affected_entry(node, dense_key);
+        let affected_child = &node.children[affected_index];
+
+        // 获取 affected entry 的 key
+        let affected_key = self.get_entry_key(affected_child)?;
+
+        // 找到 diff bit
+        let diff_bit = find_first_differing_bit(&affected_key, key)
+            .expect("Keys must be different");
+        let new_bit_value = crate::node::extract_bit(key, diff_bit);
+
+        // 使用 with_new_entry 创建新节点
+        let new_node = node.with_new_entry(
+            diff_bit,
+            new_bit_value,
+            affected_index,
+            ChildRef::Leaf(leaf_id),
+        );
+
+        let new_node_id = new_node.compute_node_id::<H>(version);
+        self.store.put_node(&new_node_id, &new_node)?;
+        Ok(new_node_id)
+    }
+
+    /// 处理节点溢出（Split）
+    fn handle_overflow(
+        &mut self,
+        node: &PersistentHOTNode,
+        key: &[u8; 32],
+        _dense_key: u32,
+        leaf_id: NodeId,
+        version: u64,
+    ) -> Result<NodeId> {
+        // Split 节点
+        let (disc_bit, left_node, right_node) = node.split();
+
+        // 存储两个子节点
+        let left_id = left_node.compute_node_id::<H>(version);
+        let right_id = right_node.compute_node_id::<H>(version);
+        self.store.put_node(&left_id, &left_node)?;
+        self.store.put_node(&right_id, &right_node)?;
+
+        // 确定新 entry 应该插入哪个子节点
+        let new_bit_value = crate::node::extract_bit(key, disc_bit);
+        let (target_node, target_id) = if new_bit_value {
+            (right_node, right_id.clone())
+        } else {
+            (left_node, left_id.clone())
+        };
+
+        // 递归插入到目标子节点
+        let new_target_id = self.insert_into_split_child(&target_node, target_id, key, leaf_id, version)?;
+
+        // 创建包含两个子节点的父节点
+        let (final_left_id, final_right_id) = if new_bit_value {
+            (left_id, new_target_id)
+        } else {
+            (new_target_id, right_id)
+        };
+
+        let bi_node = BiNode {
+            discriminative_bit: disc_bit,
+            left: final_left_id,
+            right: final_right_id,
+            height: node.height,
+        };
+
+        let parent_node = bi_node.to_two_entry_node();
+        let parent_id = parent_node.compute_node_id::<H>(version);
+        self.store.put_node(&parent_id, &parent_node)?;
+
+        Ok(parent_id)
+    }
+
+    /// 插入到 split 后的子节点
+    fn insert_into_split_child(
+        &mut self,
+        node: &PersistentHOTNode,
+        node_id: NodeId,
+        key: &[u8; 32],
+        leaf_id: NodeId,
+        version: u64,
+    ) -> Result<NodeId> {
+        // 如果子节点为空或只有一个 entry，特殊处理
+        if node.len() == 0 {
+            // 创建单叶子节点
+            let new_node = PersistentHOTNode::single_leaf(leaf_id);
+            let new_id = new_node.compute_node_id::<H>(version);
+            self.store.put_node(&new_id, &new_node)?;
+            return Ok(new_id);
+        }
+
+        if node.len() == 1 {
+            // 只有一个 entry，需要获取其 key 来计算 diff bit
+            let existing_key = self.get_entry_key(&node.children[0])?;
+            if &existing_key == key {
+                // 相同 key，替换
+                let mut new_node = node.clone();
+                new_node.children[0] = ChildRef::Leaf(leaf_id);
+                let new_id = new_node.compute_node_id::<H>(version);
+                self.store.put_node(&new_id, &new_node)?;
+                return Ok(new_id);
+            }
+
+            // 不同 key，创建两叶子节点
+            let diff_bit = find_first_differing_bit(&existing_key, key)
+                .expect("Keys must be different");
+
+            // 获取现有 entry 的 leaf_id
+            let existing_leaf_id = match &node.children[0] {
+                ChildRef::Leaf(id) => id.clone(),
+                ChildRef::Internal(_) => {
+                    // 如果是内部节点，需要特殊处理
+                    // 这里简化处理，直接使用 insert_internal
+                    return self.insert_internal(node_id, key, leaf_id, version);
+                }
+            };
+
+            let new_node = PersistentHOTNode::two_leaves(
+                &existing_key,
+                existing_leaf_id,
+                key,
+                leaf_id,
+            );
+            let new_id = new_node.compute_node_id::<H>(version);
+            self.store.put_node(&new_id, &new_node)?;
+            return Ok(new_id);
+        }
+
+        // 正常情况：使用 insert_internal
+        self.insert_internal(node_id, key, leaf_id, version)
+    }
+
+    /// 找到 affected entry 索引
+    fn find_affected_entry(&self, node: &PersistentHOTNode, dense_key: u32) -> usize {
+        // 使用 sparse matching 找到最后一个 (dense & sparse) == sparse 的 entry
+        for i in (0..node.len()).rev() {
+            let sparse = node.sparse_partial_keys[i];
+            if (dense_key & sparse) == sparse {
+                return i;
+            }
+        }
+        0 // 默认返回第一个
+    }
+
+    /// 获取 entry 对应的 key
+    fn get_entry_key(&self, child: &ChildRef) -> Result<[u8; 32]> {
+        match child {
+            ChildRef::Leaf(leaf_id) => {
+                let leaf = self
+                    .store
+                    .get_leaf(leaf_id)?
+                    .ok_or(StoreError::NotFound)?;
+                Ok(leaf.key)
+            }
+            ChildRef::Internal(node_id) => {
+                // 对于内部节点，递归获取第一个叶子的 key
+                let node = self
+                    .store
+                    .get_node(node_id)?
+                    .ok_or(StoreError::NotFound)?;
+                if node.len() > 0 {
+                    self.get_entry_key(&node.children[0])
+                } else {
+                    Err(StoreError::NotFound)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +516,82 @@ mod tests {
 
         assert!(tree.is_empty());
         assert!(tree.root_id().is_none());
+    }
+
+    // ========================================================================
+    // Insert 测试
+    // ========================================================================
+
+    #[test]
+    fn test_insert_into_empty_tree() {
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        let key = make_key(1);
+        let value = b"value1".to_vec();
+
+        tree.insert(&key, value.clone(), 1).unwrap();
+
+        assert!(!tree.is_empty());
+        let result = tree.lookup(&key).unwrap();
+        assert_eq!(result, Some(value));
+    }
+
+    #[test]
+    fn test_insert_two_keys() {
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        let key1 = make_key(1);
+        let value1 = b"value1".to_vec();
+        let key2 = make_key(2);
+        let value2 = b"value2".to_vec();
+
+        tree.insert(&key1, value1.clone(), 1).unwrap();
+        tree.insert(&key2, value2.clone(), 1).unwrap();
+
+        assert_eq!(tree.lookup(&key1).unwrap(), Some(value1));
+        assert_eq!(tree.lookup(&key2).unwrap(), Some(value2));
+    }
+
+    #[test]
+    fn test_insert_update_existing() {
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        let key = make_key(1);
+        let value1 = b"value1".to_vec();
+        let value2 = b"updated".to_vec();
+
+        tree.insert(&key, value1, 1).unwrap();
+        tree.insert(&key, value2.clone(), 2).unwrap();
+
+        let result = tree.lookup(&key).unwrap();
+        assert_eq!(result, Some(value2));
+    }
+
+    #[test]
+    fn test_insert_multiple_keys() {
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        // 插入 10 个 keys
+        for i in 0..10u8 {
+            let key = make_key(i);
+            let value = format!("value{}", i).into_bytes();
+            tree.insert(&key, value, 1).unwrap();
+        }
+
+        // 验证所有 keys 都能找到
+        for i in 0..10u8 {
+            let key = make_key(i);
+            let result = tree.lookup(&key).unwrap();
+            assert!(result.is_some(), "Key {} not found", i);
+            assert_eq!(result.unwrap(), format!("value{}", i).into_bytes());
+        }
+
+        // 验证不存在的 key
+        let missing_key = make_key(100);
+        assert!(tree.lookup(&missing_key).unwrap().is_none());
     }
 }

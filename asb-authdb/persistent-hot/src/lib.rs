@@ -41,8 +41,8 @@ pub use hash::{Blake3Hasher, HashOutput, Hasher, Keccak256Hasher};
 
 // node.rs 导出
 pub use node::{
-    extract_bit, find_first_differing_bit, make_node_id, node_id_hash, node_id_version, ChildRef,
-    LeafData, NodeId, PersistentHOTNode, SearchResult, NODE_ID_SIZE,
+    extract_bit, find_first_differing_bit, make_node_id, node_id_hash, node_id_version, BiNode,
+    ChildRef, LeafData, NodeId, PersistentHOTNode, SearchResult, NODE_ID_SIZE,
 };
 
 // simd.rs 导出
