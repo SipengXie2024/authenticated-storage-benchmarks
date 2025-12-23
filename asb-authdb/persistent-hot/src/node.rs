@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bits::pext64;
 use crate::hash::Hasher;
+use crate::simd::{simd_search, SimdSearchResult};
 
 // ============================================================================
 // NodeId
@@ -515,21 +516,12 @@ impl PersistentHOTNode {
         self.search_with_dense_key(dense_key)
     }
 
-    /// 使用已计算的 dense key 搜索
+    /// 使用已计算的 dense key 搜索（SIMD 优化）
     #[inline]
     pub fn search_with_dense_key(&self, dense_key: u32) -> SearchResult {
-        let mut last_match: Option<usize> = None;
-
-        for i in 0..self.len() {
-            let sparse_key = self.sparse_partial_keys[i];
-            if (dense_key & sparse_key) == sparse_key {
-                last_match = Some(i);
-            }
-        }
-
-        match last_match {
-            Some(index) => SearchResult::Found { index },
-            None => SearchResult::NotFound { dense_key },
+        match simd_search(&self.sparse_partial_keys, dense_key, self.len() as u8) {
+            SimdSearchResult::Found(index) => SearchResult::Found { index },
+            SimdSearchResult::NotFound => SearchResult::NotFound { dense_key },
         }
     }
 
