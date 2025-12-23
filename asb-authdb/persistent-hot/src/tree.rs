@@ -242,11 +242,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         new_leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
-        // 找到两个 key 的第一个不同 bit
-        let diff_bit = find_first_differing_bit(existing_key, new_key)
-            .expect("Keys must be different");
-
-        // 创建包含两个叶子的新节点
+        // 创建包含两个叶子的新节点（two_leaves 内部会计算 diff_bit）
         let new_child = PersistentHOTNode::two_leaves(
             existing_key,
             existing_leaf_id,
@@ -259,6 +255,11 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         // 更新父节点：将叶子替换为内部节点
         let mut new_parent = parent_node.clone();
         new_parent.children[affected_index] = ChildRef::Internal(new_child_id);
+
+        // 更新父节点高度：h(parent) = max(h(children)) + 1
+        // 新子节点 height = 1，如果父节点原来只有叶子（height=1），需要更新为 2
+        new_parent.height = std::cmp::max(parent_node.height, new_child.height + 1);
+
         let new_parent_id = new_parent.compute_node_id::<H>(version);
         self.store.put_node(&new_parent_id, &new_parent)?;
 
@@ -282,7 +283,8 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // 找到 affected entry（用于确定 diff bit）
         // 使用 sparse matching 找到最后一个匹配的 entry
-        let affected_index = self.find_affected_entry(node, dense_key);
+        let affected_index = self.find_affected_entry(node, dense_key)
+            .expect("HOT invariant violated: no matching entry found for sparse matching");
         let affected_child = &node.children[affected_index];
 
         // 获取 affected entry 的 key
@@ -307,6 +309,8 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     }
 
     /// 处理节点溢出（Split）
+    ///
+    /// 优化：先在目标子节点完成插入，再持久化，避免多余的写入
     fn handle_overflow(
         &mut self,
         node: &PersistentHOTNode,
@@ -318,35 +322,45 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         // Split 节点
         let (disc_bit, left_node, right_node) = node.split();
 
-        // 存储两个子节点
-        let left_id = left_node.compute_node_id::<H>(version);
-        let right_id = right_node.compute_node_id::<H>(version);
-        self.store.put_node(&left_id, &left_node)?;
-        self.store.put_node(&right_id, &right_node)?;
-
         // 确定新 entry 应该插入哪个子节点
         let new_bit_value = crate::node::extract_bit(key, disc_bit);
-        let (target_node, target_id) = if new_bit_value {
-            (right_node, right_id.clone())
+
+        // 分离目标节点和另一侧节点
+        let (target_node, other_node) = if new_bit_value {
+            (right_node, left_node)
         } else {
-            (left_node, left_id.clone())
+            (left_node, right_node)
         };
 
-        // 递归插入到目标子节点
+        // 先持久化另一侧节点（它不会被修改）
+        let other_id = other_node.compute_node_id::<H>(version);
+        let other_height = other_node.height;
+        self.store.put_node(&other_id, &other_node)?;
+
+        // 在目标子节点完成插入（只持久化一次最终版本）
+        let target_id = target_node.compute_node_id::<H>(version);
         let new_target_id = self.insert_into_split_child(&target_node, target_id, key, leaf_id, version)?;
+
+        // 获取更新后的目标子节点高度
+        let new_target_node = self.store.get_node(&new_target_id)?
+            .expect("Just inserted node should exist");
+        let new_target_height = new_target_node.height;
 
         // 创建包含两个子节点的父节点
         let (final_left_id, final_right_id) = if new_bit_value {
-            (left_id, new_target_id)
+            (other_id.clone(), new_target_id)
         } else {
-            (new_target_id, right_id)
+            (new_target_id, other_id.clone())
         };
+
+        // BiNode.height 应该是两个子节点高度的最大值
+        let max_child_height = std::cmp::max(new_target_height, other_height);
 
         let bi_node = BiNode {
             discriminative_bit: disc_bit,
             left: final_left_id,
             right: final_right_id,
-            height: node.height,
+            height: max_child_height,
         };
 
         let parent_node = bi_node.to_two_entry_node();
@@ -387,9 +401,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             }
 
             // 不同 key，创建两叶子节点
-            let diff_bit = find_first_differing_bit(&existing_key, key)
-                .expect("Keys must be different");
-
             // 获取现有 entry 的 leaf_id
             let existing_leaf_id = match &node.children[0] {
                 ChildRef::Leaf(id) => id.clone(),
@@ -416,15 +427,19 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     }
 
     /// 找到 affected entry 索引
-    fn find_affected_entry(&self, node: &PersistentHOTNode, dense_key: u32) -> usize {
+    ///
+    /// 使用 sparse matching 找到最后一个 (dense & sparse) == sparse 的 entry。
+    /// 按照 HOT 设计，应该总是能找到匹配（至少 sparse=0 总是匹配）。
+    /// 返回 None 表示数据结构不一致。
+    fn find_affected_entry(&self, node: &PersistentHOTNode, dense_key: u32) -> Option<usize> {
         // 使用 sparse matching 找到最后一个 (dense & sparse) == sparse 的 entry
         for i in (0..node.len()).rev() {
             let sparse = node.sparse_partial_keys[i];
             if (dense_key & sparse) == sparse {
-                return i;
+                return Some(i);
             }
         }
-        0 // 默认返回第一个
+        None // 数据结构不一致
     }
 
     /// 获取 entry 对应的 key

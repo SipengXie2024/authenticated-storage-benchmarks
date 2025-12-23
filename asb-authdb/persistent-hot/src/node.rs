@@ -616,7 +616,7 @@ impl PersistentHOTNode {
         sparse_partial_keys[1] = 1; // bit = 1
 
         Self {
-            height: 2,
+            height: 1, // 只包含叶子指针的节点 height = 1
             extraction_masks: Self::masks_from_bits(&[diff_bit]),
             sparse_partial_keys,
             children: vec![ChildRef::Leaf(id_first), ChildRef::Leaf(id_second)],
@@ -829,6 +829,7 @@ impl PersistentHOTNode {
     /// 获取 root bit = 1 的 entries 掩码
     ///
     /// 返回 u32 位掩码，每一位表示对应 entry 的 root bit 是否为 1
+    #[cfg(test)]
     fn get_mask_for_larger_entries(&self) -> u32 {
         let root_mask = self.get_root_mask();
         if root_mask == 0 {
@@ -1273,7 +1274,7 @@ mod tests {
         let node = PersistentHOTNode::two_leaves(&key1, id1, &key2, id2);
 
         assert_eq!(node.len(), 2);
-        assert_eq!(node.height, 2);
+        assert_eq!(node.height, 1); // 只包含叶子指针的节点 height = 1
         assert_eq!(node.span(), 1);
         assert_eq!(node.sparse_partial_keys[0], 0);
         assert_eq!(node.sparse_partial_keys[1], 1);
@@ -1485,8 +1486,6 @@ mod tests {
     #[test]
     fn test_bitmask_consistency_with_pext() {
         // 验证 get_mask_for_bit 与实际 PEXT 结果一致
-        use crate::bits::pext64;
-
         let bits = vec![3, 7, 100];
         let mut node = PersistentHOTNode::empty(1);
         node.extraction_masks = PersistentHOTNode::masks_from_bits(&bits);

@@ -208,7 +208,11 @@ pub fn find_insert_position_scalar(sparse_keys: &[u32; 32], sparse_key: u32, len
 
 /// AVX2 优化实现
 ///
-/// 使用 signed 比较（sparse_key 最多 31 bits，不会溢出 i32）
+/// 使用无符号比较（通过 XOR 0x80000000 转换为有符号比较）
+///
+/// AVX2 没有无符号比较指令，但可以通过翻转符号位来模拟：
+/// - XOR 0x80000000 后，无符号顺序变成有符号顺序
+/// - 例如：0x00000000 → 0x80000000 (最小), 0xFFFFFFFF → 0x7FFFFFFF (最大)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -217,8 +221,11 @@ unsafe fn simd_find_insert_position_avx2(
     sparse_key: u32,
     len: u8,
 ) -> usize {
-    // 广播 sparse_key 到 8 个 lane
-    let key_vec = _mm256_set1_epi32(sparse_key as i32);
+    // 用于将无符号比较转换为有符号比较的常量
+    let sign_bit = _mm256_set1_epi32(0x80000000u32 as i32);
+
+    // 广播 sparse_key 并翻转符号位
+    let key_vec = _mm256_xor_si256(_mm256_set1_epi32(sparse_key as i32), sign_bit);
 
     // 构建有效位掩码
     let valid_mask: u32 = if len >= 32 {
@@ -230,28 +237,32 @@ unsafe fn simd_find_insert_position_avx2(
     let mut gt_mask: u32 = 0;
 
     // 处理 4 组，每组 8 个 u32
-    // 找所有 sparse_keys[i] > sparse_key 的位置
+    // 找所有 sparse_keys[i] > sparse_key 的位置（无符号比较）
     {
         let sparse_vec = _mm256_loadu_si256(sparse_keys.as_ptr() as *const __m256i);
-        let cmp_result = _mm256_cmpgt_epi32(sparse_vec, key_vec);
+        let sparse_xor = _mm256_xor_si256(sparse_vec, sign_bit);
+        let cmp_result = _mm256_cmpgt_epi32(sparse_xor, key_vec);
         let mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_result)) as u32;
         gt_mask |= mask;
     }
     {
         let sparse_vec = _mm256_loadu_si256(sparse_keys.as_ptr().add(8) as *const __m256i);
-        let cmp_result = _mm256_cmpgt_epi32(sparse_vec, key_vec);
+        let sparse_xor = _mm256_xor_si256(sparse_vec, sign_bit);
+        let cmp_result = _mm256_cmpgt_epi32(sparse_xor, key_vec);
         let mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_result)) as u32;
         gt_mask |= mask << 8;
     }
     {
         let sparse_vec = _mm256_loadu_si256(sparse_keys.as_ptr().add(16) as *const __m256i);
-        let cmp_result = _mm256_cmpgt_epi32(sparse_vec, key_vec);
+        let sparse_xor = _mm256_xor_si256(sparse_vec, sign_bit);
+        let cmp_result = _mm256_cmpgt_epi32(sparse_xor, key_vec);
         let mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_result)) as u32;
         gt_mask |= mask << 16;
     }
     {
         let sparse_vec = _mm256_loadu_si256(sparse_keys.as_ptr().add(24) as *const __m256i);
-        let cmp_result = _mm256_cmpgt_epi32(sparse_vec, key_vec);
+        let sparse_xor = _mm256_xor_si256(sparse_vec, sign_bit);
+        let cmp_result = _mm256_cmpgt_epi32(sparse_xor, key_vec);
         let mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_result)) as u32;
         gt_mask |= mask << 24;
     }
@@ -471,5 +482,40 @@ mod tests {
         assert_eq!(simd_find_insert_position(&sparse_keys, 35, 3), 3);
         // len=4，考虑 index 3
         assert_eq!(simd_find_insert_position(&sparse_keys, 35, 4), 3);
+    }
+
+    #[test]
+    fn test_find_insert_position_unsigned_comparison() {
+        // 测试 bit31 设置时的无符号比较
+        // 这是 span=32 时可能出现的情况
+        let mut sparse_keys = [0u32; 32];
+
+        // 设置一些包含 bit31 的值（无符号很大，有符号为负）
+        sparse_keys[0] = 0x00000001; // 1
+        sparse_keys[1] = 0x7FFFFFFF; // 2^31 - 1 (最大正 i32)
+        sparse_keys[2] = 0x80000000; // 2^31 (最小负 i32，但无符号更大)
+        sparse_keys[3] = 0x80000001; // 2^31 + 1
+        sparse_keys[4] = 0xFFFFFFFF; // 2^32 - 1 (最大 u32)
+
+        // 无符号顺序: 1 < 0x7FFFFFFF < 0x80000000 < 0x80000001 < 0xFFFFFFFF
+
+        // 插入 0 应该在位置 0
+        assert_eq!(simd_find_insert_position(&sparse_keys, 0, 5), 0);
+
+        // 插入 2 应该在位置 1 (在 1 和 0x7FFFFFFF 之间)
+        assert_eq!(simd_find_insert_position(&sparse_keys, 2, 5), 1);
+
+        // 插入 0x80000000 应该在位置 3 (找第一个 > key 的位置，即 0x80000001)
+        assert_eq!(simd_find_insert_position(&sparse_keys, 0x80000000, 5), 3);
+
+        // 插入 0x80000002 应该在位置 4 (在 0x80000001 和 0xFFFFFFFF 之间)
+        assert_eq!(simd_find_insert_position(&sparse_keys, 0x80000002, 5), 4);
+
+        // 验证 scalar 和 SIMD 一致
+        for &key in &[0u32, 1, 2, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFE, 0xFFFFFFFF] {
+            let scalar = find_insert_position_scalar(&sparse_keys, key, 5);
+            let simd = simd_find_insert_position(&sparse_keys, key, 5);
+            assert_eq!(scalar, simd, "Mismatch for key=0x{:08X}", key);
+        }
     }
 }
