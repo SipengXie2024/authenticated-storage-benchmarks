@@ -188,9 +188,19 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         let new_child_id =
                             self.insert_internal(child_id.clone(), key, leaf_id, version)?;
 
-                        // 更新当前节点的 child 引用
+                        // 读取新子节点获取其 height（可能因 leaf_pushdown 等操作而改变）
+                        let new_child = self
+                            .store
+                            .get_node(&new_child_id)?
+                            .ok_or(StoreError::NotFound)?;
+                        let new_child_height = new_child.height;
+
+                        // 更新当前节点的 child 引用和 height
                         let mut new_node = node.clone();
                         new_node.children[index] = ChildRef::Internal(new_child_id);
+                        // 维护 h(n) = max(h(children)) + 1 不变量
+                        new_node.height = std::cmp::max(new_node.height, new_child_height + 1);
+
                         let new_node_id = new_node.compute_node_id::<H>(version);
                         self.store.put_node(&new_node_id, &new_node)?;
                         Ok(new_node_id)
@@ -405,8 +415,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             let existing_leaf_id = match &node.children[0] {
                 ChildRef::Leaf(id) => id.clone(),
                 ChildRef::Internal(_) => {
-                    // 如果是内部节点，需要特殊处理
-                    // 这里简化处理，直接使用 insert_internal
+                    // 如果是内部节点，需要递归插入
+                    // 注意：这里需要先持久化 node，因为 insert_internal 会从存储读取
+                    self.store.put_node(&node_id, node)?;
                     return self.insert_internal(node_id, key, leaf_id, version);
                 }
             };
@@ -422,8 +433,28 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             return Ok(new_id);
         }
 
-        // 正常情况：使用 insert_internal
-        self.insert_internal(node_id, key, leaf_id, version)
+        // 正常情况：直接基于传入的 node 进行插入（不从存储读取）
+        // Split 后的节点最多约 16 entries，加一个不会溢出
+        let dense_key = node.extract_dense_partial_key(key);
+        let affected_index = self.find_affected_entry(node, dense_key)
+            .expect("HOT invariant violated: no matching entry found");
+        let affected_child = &node.children[affected_index];
+        let affected_key = self.get_entry_key(affected_child)?;
+
+        let diff_bit = find_first_differing_bit(&affected_key, key)
+            .expect("Keys must be different");
+        let new_bit_value = crate::node::extract_bit(key, diff_bit);
+
+        let new_node = node.with_new_entry(
+            diff_bit,
+            new_bit_value,
+            affected_index,
+            ChildRef::Leaf(leaf_id),
+        );
+        let new_id = new_node.compute_node_id::<H>(version);
+        self.store.put_node(&new_id, &new_node)?;
+
+        Ok(new_id)
     }
 
     /// 找到 affected entry 索引

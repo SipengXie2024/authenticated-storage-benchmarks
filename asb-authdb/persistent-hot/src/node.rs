@@ -884,17 +884,36 @@ impl PersistentHOTNode {
     /// 压缩指定 entries 到新节点
     ///
     /// 移除 root_bit 对应的 discriminative bit，重新编码 sparse keys
+    ///
+    /// # Panics
+    ///
+    /// 在 debug 模式下，如果 `indices` 为空会 panic。
+    /// Split 后两侧必须非空是 HOT 的不变量。
     fn compress_entries(&self, indices: &[usize], removed_bit: u16) -> PersistentHOTNode {
+        debug_assert!(
+            !indices.is_empty(),
+            "HOT invariant violated: split should produce non-empty partitions"
+        );
         if indices.is_empty() {
             return PersistentHOTNode::empty(self.height);
         }
 
-        // 单个 entry 直接返回（但这在 HOT 中不应该发生在 split 时）
+        // 单个 entry：与 C++ 一致的 height 语义
+        // C++ compressEntries 单 entry 时直接返回原 ChildPointer（不创建新节点）
+        // C++ getHeight(): isLeaf() ? 0 : getNode()->mHeight
         if indices.len() == 1 {
             let idx = indices[0];
-            let mut node = PersistentHOTNode::empty(self.height);
-            // 只有一个 entry，无 discriminative bits
-            node.children.push(self.children[idx].clone());
+            let child = &self.children[idx];
+
+            // Leaf 的 "height" = 0（C++ 语义），包装节点 height = 0 + 1 = 1
+            // Internal 保守使用 self.height（无法访问 store 查询实际值）
+            let height = match child {
+                ChildRef::Leaf(_) => 1,
+                ChildRef::Internal(_) => self.height,
+            };
+
+            let mut node = PersistentHOTNode::empty(height);
+            node.children.push(child.clone());
             return node;
         }
 
@@ -913,9 +932,17 @@ impl PersistentHOTNode {
         let all_bits = self.get_all_mask_bits();
         let compression_mask = all_bits & !root_sparse_mask;
 
+        // 计算新节点 height（与 C++ 一致）
+        // - 如果所有选中的 children 都是 Leaf，height = 1
+        // - 否则保守使用 self.height（无法访问 store 查询 Internal 节点的实际 height）
+        let all_leaves = indices.iter().all(|&idx| {
+            matches!(self.children[idx], ChildRef::Leaf(_))
+        });
+        let height = if all_leaves { 1 } else { self.height };
+
         // 构建新节点
         let mut new_node = PersistentHOTNode {
-            height: self.height,
+            height,
             extraction_masks: new_masks,
             sparse_partial_keys: [0; 32],
             children: Vec::with_capacity(indices.len()),
