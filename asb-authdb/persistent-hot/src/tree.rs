@@ -7,9 +7,33 @@ use std::marker::PhantomData;
 
 use crate::hash::{Blake3Hasher, Hasher};
 use crate::node::{
-    find_first_differing_bit, BiNode, ChildRef, LeafData, NodeId, PersistentHOTNode, SearchResult,
+    extract_bit, find_first_differing_bit, BiNode, ChildRef, LeafData, NodeId,
+    PersistentHOTNode, SearchResult,
 };
 use crate::store::{NodeStore, Result, StoreError};
+
+// ============================================================================
+// Insert Stack
+// ============================================================================
+
+/// 插入栈条目
+///
+/// 用于追踪从根到当前节点的路径，支持 Parent Pull Up 操作。
+/// 在 overflow 处理时，需要沿路径向上传播更新。
+#[derive(Debug, Clone)]
+struct InsertStackEntry {
+    /// 当前节点的 ID（用于调试和潜在的扩展）
+    #[allow(dead_code)]
+    node_id: NodeId,
+    /// 选中的 child 索引（用于 overflow 时更新父节点）
+    child_index: usize,
+    /// 缓存的节点数据（避免重复读取）
+    node: PersistentHOTNode,
+}
+
+// ============================================================================
+// HOT Tree
+// ============================================================================
 
 /// Height Optimized Trie
 ///
@@ -122,7 +146,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     }
 
     // ========================================================================
-    // Insert 操作
+    // Insert 操作（栈 + 迭代模式）
     // ========================================================================
 
     /// 插入 key-value 对
@@ -156,87 +180,100 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 Ok(())
             }
             Some(root_id) => {
-                // 非空树：递归插入
-                let new_root_id = self.insert_internal(root_id.clone(), key, leaf_id, version)?;
-                self.root_id = Some(new_root_id);
-                Ok(())
+                // 非空树：使用栈模式插入
+                self.insert_with_stack(root_id.clone(), key, leaf_id, version)
             }
         }
     }
 
-    /// 递归插入到节点
+    /// 使用栈模式插入（支持 Parent Pull Up）
     ///
-    /// 返回新的节点 ID（可能是修改后的当前节点，或新创建的父节点）
-    fn insert_internal(
+    /// # 流程
+    ///
+    /// 1. Phase 1：向下搜索，构建 stack（记录从根到目标节点的路径）
+    /// 2. Phase 2：在目标节点执行操作（Normal Insert / Leaf Pushdown / Overflow）
+    /// 3. Phase 3：如果发生 overflow，调用 handle_overflow_with_stack 处理
+    /// 4. Phase 4：向上传播指针更新
+    fn insert_with_stack(
         &mut self,
-        node_id: NodeId,
+        root_id: NodeId,
         key: &[u8; 32],
         leaf_id: NodeId,
         version: u64,
-    ) -> Result<NodeId> {
-        let node = self
-            .store
-            .get_node(&node_id)?
-            .ok_or(StoreError::NotFound)?;
+    ) -> Result<()> {
+        let mut stack: Vec<InsertStackEntry> = Vec::new();
+        let mut current_id = root_id;
 
-        match node.search(key) {
-            SearchResult::Found { index } => {
-                // 找到匹配的 entry
-                match &node.children[index] {
-                    ChildRef::Internal(child_id) => {
-                        // 递归插入到子节点
-                        let new_child_id =
-                            self.insert_internal(child_id.clone(), key, leaf_id, version)?;
+        // Phase 1: 向下搜索，构建 stack
+        loop {
+            let node = self
+                .store
+                .get_node(&current_id)?
+                .ok_or(StoreError::NotFound)?;
 
-                        // 读取新子节点获取其 height（可能因 leaf_pushdown 等操作而改变）
-                        let new_child = self
-                            .store
-                            .get_node(&new_child_id)?
-                            .ok_or(StoreError::NotFound)?;
-                        let new_child_height = new_child.height;
+            match node.search(key) {
+                SearchResult::Found { index } => {
+                    // 先提取需要的信息，避免借用冲突
+                    let child_ref = node.children[index].clone();
 
-                        // 更新当前节点的 child 引用和 height
-                        let mut new_node = node.clone();
-                        new_node.children[index] = ChildRef::Internal(new_child_id);
-                        // 维护 h(n) = max(h(children)) + 1 不变量
-                        new_node.height = std::cmp::max(new_node.height, new_child_height + 1);
+                    match child_ref {
+                        ChildRef::Internal(child_id) => {
+                            // 记录当前节点到栈，继续向下
+                            stack.push(InsertStackEntry {
+                                node_id: current_id,
+                                child_index: index,
+                                node,
+                            });
+                            current_id = child_id;
+                            continue;
+                        }
+                        ChildRef::Leaf(existing_leaf_id) => {
+                            // 到达叶子，处理碰撞
+                            let existing_leaf = self
+                                .store
+                                .get_leaf(&existing_leaf_id)?
+                                .ok_or(StoreError::NotFound)?;
 
-                        let new_node_id = new_node.compute_node_id::<H>(version);
-                        self.store.put_node(&new_node_id, &new_node)?;
-                        Ok(new_node_id)
-                    }
-                    ChildRef::Leaf(existing_leaf_id) => {
-                        // 叶子节点：需要处理碰撞
-                        let existing_leaf = self
-                            .store
-                            .get_leaf(existing_leaf_id)?
-                            .ok_or(StoreError::NotFound)?;
+                            let new_child_id = if &existing_leaf.key == key {
+                                // 相同 key：替换值
+                                let mut new_node = node.clone();
+                                new_node.children[index] = ChildRef::Leaf(leaf_id);
+                                let new_node_id = new_node.compute_node_id::<H>(version);
+                                self.store.put_node(&new_node_id, &new_node)?;
+                                new_node_id
+                            } else {
+                                // 不同 key：Leaf Node Pushdown
+                                self.leaf_pushdown(
+                                    &node,
+                                    index,
+                                    &existing_leaf.key,
+                                    existing_leaf_id,
+                                    key,
+                                    leaf_id,
+                                    version,
+                                )?
+                            };
 
-                        if &existing_leaf.key == key {
-                            // 相同 key：替换值（更新 leaf）
-                            let mut new_node = node.clone();
-                            new_node.children[index] = ChildRef::Leaf(leaf_id);
-                            let new_node_id = new_node.compute_node_id::<H>(version);
-                            self.store.put_node(&new_node_id, &new_node)?;
-                            Ok(new_node_id)
-                        } else {
-                            // 不同 key：Leaf Node Pushdown
-                            self.leaf_pushdown(
-                                &node,
-                                index,
-                                &existing_leaf.key,
-                                existing_leaf_id.clone(),
-                                key,
-                                leaf_id,
-                                version,
-                            )
+                            // 向上传播更新
+                            return self.propagate_pointer_updates(stack, new_child_id, version);
                         }
                     }
                 }
-            }
-            SearchResult::NotFound { dense_key } => {
-                // 没有匹配的 entry：需要添加新 entry
-                self.add_entry_to_node(&node, key, dense_key, leaf_id, version)
+                SearchResult::NotFound { dense_key } => {
+                    // 没有匹配的 entry：需要添加新 entry
+                    let new_node_id = self.add_entry_to_node_with_stack(
+                        &mut stack,
+                        current_id,
+                        node,
+                        key,
+                        dense_key,
+                        leaf_id,
+                        version,
+                    )?;
+
+                    // 向上传播更新
+                    return self.propagate_pointer_updates(stack, new_node_id, version);
+                }
             }
         }
     }
@@ -252,7 +289,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         new_leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
-        // 创建包含两个叶子的新节点（two_leaves 内部会计算 diff_bit）
+        // 创建包含两个叶子的新节点
         let new_child = PersistentHOTNode::two_leaves(
             existing_key,
             existing_leaf_id,
@@ -264,10 +301,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // 更新父节点：将叶子替换为内部节点
         let mut new_parent = parent_node.clone();
-        new_parent.children[affected_index] = ChildRef::Internal(new_child_id);
+        new_parent.children[affected_index] = ChildRef::Internal(new_child_id.clone());
 
-        // 更新父节点高度：h(parent) = max(h(children)) + 1
-        // 新子节点 height = 1，如果父节点原来只有叶子（height=1），需要更新为 2
+        // 更新父节点高度
         new_parent.height = std::cmp::max(parent_node.height, new_child.height + 1);
 
         let new_parent_id = new_parent.compute_node_id::<H>(version);
@@ -276,10 +312,12 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         Ok(new_parent_id)
     }
 
-    /// 向节点添加新 entry
-    fn add_entry_to_node(
+    /// 向节点添加新 entry（带栈支持）
+    fn add_entry_to_node_with_stack(
         &mut self,
-        node: &PersistentHOTNode,
+        stack: &mut Vec<InsertStackEntry>,
+        current_id: NodeId,
+        node: PersistentHOTNode,
         key: &[u8; 32],
         dense_key: u32,
         leaf_id: NodeId,
@@ -287,14 +325,20 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     ) -> Result<NodeId> {
         // 检查节点是否已满
         if node.len() >= 32 {
-            // 节点溢出：需要 Split
-            return self.handle_overflow(node, key, dense_key, leaf_id, version);
+            // 节点溢出：需要 Split + Parent Pull Up / Intermediate Node Creation
+            return self.handle_overflow_with_stack(
+                stack,
+                current_id,
+                &node,
+                key,
+                leaf_id,
+                version,
+            );
         }
 
-        // 找到 affected entry（用于确定 diff bit）
-        // 使用 sparse matching 找到最后一个匹配的 entry
-        let affected_index = self.find_affected_entry(node, dense_key)
-            .expect("HOT invariant violated: no matching entry found for sparse matching");
+        // 找到 affected entry
+        let affected_index = self.find_affected_entry(&node, dense_key)
+            .expect("HOT invariant violated: no matching entry found");
         let affected_child = &node.children[affected_index];
 
         // 获取 affected entry 的 key
@@ -303,7 +347,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         // 找到 diff bit
         let diff_bit = find_first_differing_bit(&affected_key, key)
             .expect("Keys must be different");
-        let new_bit_value = crate::node::extract_bit(key, diff_bit);
+        let new_bit_value = extract_bit(key, diff_bit);
 
         // 使用 with_new_entry 创建新节点
         let new_node = node.with_new_entry(
@@ -318,80 +362,145 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         Ok(new_node_id)
     }
 
-    /// 处理节点溢出（Split）
+    /// 处理节点溢出（带栈支持的完整 Parent Pull Up / Intermediate Node Creation）
     ///
-    /// 优化：先在目标子节点完成插入，再持久化，避免多余的写入
-    fn handle_overflow(
+    /// # 逻辑
+    ///
+    /// 1. Split 当前节点
+    /// 2. 在目标子节点完成叶子插入
+    /// 3. 创建 BiNode
+    /// 4. 检查父节点高度决定策略：
+    ///    - `bi_node.height == parent.height` → Parent Pull Up
+    ///    - `bi_node.height < parent.height` → Intermediate Node Creation
+    /// 5. Parent Pull Up 可能递归（父节点也满了）
+    fn handle_overflow_with_stack(
         &mut self,
+        stack: &mut Vec<InsertStackEntry>,
+        _current_id: NodeId,
         node: &PersistentHOTNode,
         key: &[u8; 32],
-        _dense_key: u32,
         leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
-        // Split 节点
+        // Step 1: Split 当前节点
         let (disc_bit, left_node, right_node) = node.split();
 
-        // 确定新 entry 应该插入哪个子节点
-        let new_bit_value = crate::node::extract_bit(key, disc_bit);
-
-        // 分离目标节点和另一侧节点
+        // Step 2: 确定新 entry 插入哪侧
+        let new_bit_value = extract_bit(key, disc_bit);
         let (target_node, other_node) = if new_bit_value {
             (right_node, left_node)
         } else {
             (left_node, right_node)
         };
 
-        // 先持久化另一侧节点（它不会被修改）
+        // Step 3: 持久化另一侧节点
         let other_id = other_node.compute_node_id::<H>(version);
         let other_height = other_node.height;
         self.store.put_node(&other_id, &other_node)?;
 
-        // 在目标子节点完成插入（只持久化一次最终版本）
-        let target_id = target_node.compute_node_id::<H>(version);
-        let new_target_id = self.insert_into_split_child(&target_node, target_id, key, leaf_id, version)?;
+        // Step 4: 在目标节点完成插入
+        let new_target_id = self.insert_into_split_child(&target_node, key, leaf_id, version)?;
 
         // 获取更新后的目标子节点高度
         let new_target_node = self.store.get_node(&new_target_id)?
             .expect("Just inserted node should exist");
         let new_target_height = new_target_node.height;
 
-        // 创建包含两个子节点的父节点
+        // Step 5: 创建 BiNode
         let (final_left_id, final_right_id) = if new_bit_value {
             (other_id.clone(), new_target_id)
         } else {
             (new_target_id, other_id.clone())
         };
 
-        // BiNode.height 应该是两个子节点高度的最大值
         let max_child_height = std::cmp::max(new_target_height, other_height);
-
-        let bi_node = BiNode {
+        // BiNode.height = 子节点最大高度 + 1（与 C++ HOTSingleThreadedNode.hpp L560 一致）
+        // 这表示"如果将 BiNode 实体化为节点，该节点的高度"
+        let mut bi_node = BiNode {
             discriminative_bit: disc_bit,
             left: final_left_id,
             right: final_right_id,
-            height: max_child_height,
+            height: max_child_height + 1,
         };
 
-        let parent_node = bi_node.to_two_entry_node();
-        let parent_id = parent_node.compute_node_id::<H>(version);
-        self.store.put_node(&parent_id, &parent_node)?;
+        // Step 6: 向上处理 - Parent Pull Up 或 Intermediate Node Creation
+        while let Some(parent_entry) = stack.pop() {
+            let parent = &parent_entry.node;
 
-        Ok(parent_id)
+            if bi_node.height == parent.height {
+                // ===== PARENT PULL UP =====
+                let new_parent = parent.with_integrated_binode(parent_entry.child_index, &bi_node);
+
+                if new_parent.is_full() {
+                    // 父节点也满了，继续 split 并递归
+                    let (d, l, r) = new_parent.split();
+                    let l_id = l.compute_node_id::<H>(version);
+                    let r_id = r.compute_node_id::<H>(version);
+                    self.store.put_node(&l_id, &l)?;
+                    self.store.put_node(&r_id, &r)?;
+
+                    let l_height = l.height;
+                    let r_height = r.height;
+                    bi_node = BiNode {
+                        discriminative_bit: d,
+                        left: l_id,
+                        right: r_id,
+                        height: std::cmp::max(l_height, r_height) + 1,
+                    };
+                    // 继续 while 循环处理上层
+                } else {
+                    // 父节点未满，存储并结束
+                    let new_parent_id = new_parent.compute_node_id::<H>(version);
+                    self.store.put_node(&new_parent_id, &new_parent)?;
+
+                    // 向上传播指针更新（take stack 避免 clone 开销）
+                    self.propagate_pointer_updates(std::mem::take(stack), new_parent_id.clone(), version)?;
+                    return Ok(new_parent_id);
+                }
+            } else {
+                // ===== INTERMEDIATE NODE CREATION =====
+                // bi_node.height < parent.height
+                let intermediate = bi_node.to_two_entry_node();
+                let intermediate_id = intermediate.compute_node_id::<H>(version);
+                self.store.put_node(&intermediate_id, &intermediate)?;
+
+                // 更新父节点的 child 引用
+                let mut new_parent = parent.clone();
+                new_parent.children[parent_entry.child_index] =
+                    ChildRef::Internal(intermediate_id.clone());
+
+                // 更新父节点高度
+                new_parent.height =
+                    std::cmp::max(new_parent.height, intermediate.height + 1);
+
+                let new_parent_id = new_parent.compute_node_id::<H>(version);
+                self.store.put_node(&new_parent_id, &new_parent)?;
+
+                // 向上传播指针更新（take stack 避免 clone 开销）
+                self.propagate_pointer_updates(std::mem::take(stack), new_parent_id.clone(), version)?;
+                return Ok(new_parent_id);
+            }
+        }
+
+        // Step 7: 到达 root 且仍需处理，创建新 root
+        let new_root = bi_node.to_two_entry_node();
+        let new_root_id = new_root.compute_node_id::<H>(version);
+        self.store.put_node(&new_root_id, &new_root)?;
+        self.root_id = Some(new_root_id.clone());
+
+        Ok(new_root_id)
     }
 
     /// 插入到 split 后的子节点
     fn insert_into_split_child(
         &mut self,
         node: &PersistentHOTNode,
-        node_id: NodeId,
         key: &[u8; 32],
         leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
-        // 如果子节点为空或只有一个 entry，特殊处理
+        // 如果子节点为空，创建单叶子节点
         if node.len() == 0 {
-            // 创建单叶子节点
             let new_node = PersistentHOTNode::single_leaf(leaf_id);
             let new_id = new_node.compute_node_id::<H>(version);
             self.store.put_node(&new_id, &new_node)?;
@@ -399,7 +508,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         }
 
         if node.len() == 1 {
-            // 只有一个 entry，需要获取其 key 来计算 diff bit
+            // 只有一个 entry
             let existing_key = self.get_entry_key(&node.children[0])?;
             if &existing_key == key {
                 // 相同 key，替换
@@ -411,30 +520,58 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             }
 
             // 不同 key，创建两叶子节点
-            // 获取现有 entry 的 leaf_id
-            let existing_leaf_id = match &node.children[0] {
-                ChildRef::Leaf(id) => id.clone(),
-                ChildRef::Internal(_) => {
-                    // 如果是内部节点，需要递归插入
-                    // 注意：这里需要先持久化 node，因为 insert_internal 会从存储读取
-                    self.store.put_node(&node_id, node)?;
-                    return self.insert_internal(node_id, key, leaf_id, version);
+            match &node.children[0] {
+                ChildRef::Leaf(existing_leaf_id) => {
+                    let new_node = PersistentHOTNode::two_leaves(
+                        &existing_key,
+                        existing_leaf_id.clone(),
+                        key,
+                        leaf_id,
+                    );
+                    let new_id = new_node.compute_node_id::<H>(version);
+                    self.store.put_node(&new_id, &new_node)?;
+                    return Ok(new_id);
                 }
-            };
+                ChildRef::Internal(child_id) => {
+                    // 与 Leaf 类似，创建包含旧 Internal 和新 Leaf 的两 entry 节点
+                    // （与 C++ HOTSingleThreadedNode.hpp L533-536 一致）
 
-            let new_node = PersistentHOTNode::two_leaves(
-                &existing_key,
-                existing_leaf_id,
-                key,
-                leaf_id,
-            );
-            let new_id = new_node.compute_node_id::<H>(version);
-            self.store.put_node(&new_id, &new_node)?;
-            return Ok(new_id);
+                    // 获取 Internal 子节点的高度
+                    let child_node = self.store.get_node(child_id)?
+                        .expect("Internal child should exist");
+                    let child_height = child_node.height;
+
+                    // 找到 diff bit
+                    let diff_bit = find_first_differing_bit(&existing_key, key)
+                        .expect("Keys must be different");
+
+                    // 根据新 key 在 diff_bit 上的值确定排序
+                    // bit=0 的 entry 在前（sparse_key=0），bit=1 的在后（sparse_key=1）
+                    let new_bit_value = extract_bit(key, diff_bit);
+                    let (first_child, second_child) = if new_bit_value {
+                        // key 的 bit=1，所以 Leaf 在后，Internal 在前
+                        (ChildRef::Internal(child_id.clone()), ChildRef::Leaf(leaf_id))
+                    } else {
+                        // key 的 bit=0，所以 Leaf 在前，Internal 在后
+                        (ChildRef::Leaf(leaf_id), ChildRef::Internal(child_id.clone()))
+                    };
+
+                    // 创建节点：height = max(child_height, 0) + 1 = child_height + 1
+                    // （Leaf 的 height=0，Internal 的 height=child_height）
+                    let mut new_node = PersistentHOTNode::empty(child_height + 1);
+                    new_node.extraction_masks = PersistentHOTNode::masks_from_bits(&[diff_bit]);
+                    new_node.sparse_partial_keys[0] = 0;
+                    new_node.sparse_partial_keys[1] = 1;
+                    new_node.children = vec![first_child, second_child];
+
+                    let new_id = new_node.compute_node_id::<H>(version);
+                    self.store.put_node(&new_id, &new_node)?;
+                    return Ok(new_id);
+                }
+            }
         }
 
-        // 正常情况：直接基于传入的 node 进行插入（不从存储读取）
-        // Split 后的节点最多约 16 entries，加一个不会溢出
+        // 正常情况：直接添加 entry（split 后节点最多约 16 entries）
         let dense_key = node.extract_dense_partial_key(key);
         let affected_index = self.find_affected_entry(node, dense_key)
             .expect("HOT invariant violated: no matching entry found");
@@ -443,7 +580,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         let diff_bit = find_first_differing_bit(&affected_key, key)
             .expect("Keys must be different");
-        let new_bit_value = crate::node::extract_bit(key, diff_bit);
+        let new_bit_value = extract_bit(key, diff_bit);
 
         let new_node = node.with_new_entry(
             diff_bit,
@@ -455,6 +592,35 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         self.store.put_node(&new_id, &new_node)?;
 
         Ok(new_id)
+    }
+
+    /// 向上传播指针更新
+    ///
+    /// 从栈中依次取出父节点，更新其 child 引用
+    fn propagate_pointer_updates(
+        &mut self,
+        mut stack: Vec<InsertStackEntry>,
+        mut new_child_id: NodeId,
+        version: u64,
+    ) -> Result<()> {
+        while let Some(entry) = stack.pop() {
+            // 更新父节点的 child 引用
+            let mut new_node = entry.node.clone();
+            new_node.children[entry.child_index] = ChildRef::Internal(new_child_id.clone());
+
+            // 读取新子节点获取高度（用于维护 height 不变量）
+            if let Ok(Some(child)) = self.store.get_node(&new_child_id) {
+                new_node.height = std::cmp::max(new_node.height, child.height + 1);
+            }
+
+            let new_node_id = new_node.compute_node_id::<H>(version);
+            self.store.put_node(&new_node_id, &new_node)?;
+            new_child_id = new_node_id;
+        }
+
+        // 更新根节点
+        self.root_id = Some(new_child_id);
+        Ok(())
     }
 
     /// 找到 affected entry 索引
@@ -639,5 +805,106 @@ mod tests {
         // 验证不存在的 key
         let missing_key = make_key(100);
         assert!(tree.lookup(&missing_key).unwrap().is_none());
+    }
+
+    // ========================================================================
+    // Overflow 测试（触发 Split 和 Parent Pull Up / Intermediate Node Creation）
+    // ========================================================================
+
+    /// 辅助函数：创建更分散的 key（避免都在第一个字节区分）
+    fn make_dispersed_key(seed: u8) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        // 使用简单的线性同余生成器来分散 bits
+        let mut v = seed as u32;
+        for byte in key.iter_mut() {
+            v = v.wrapping_mul(1103515245).wrapping_add(12345);
+            *byte = (v >> 16) as u8;
+        }
+        key
+    }
+
+    #[test]
+    fn test_insert_triggers_overflow() {
+        // 插入超过 32 个 key 来触发 overflow
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        // 插入 40 个 keys，这应该触发至少一次 split
+        for i in 0..40u8 {
+            let key = make_dispersed_key(i);
+            let value = format!("value{}", i).into_bytes();
+            tree.insert(&key, value, 1).unwrap();
+        }
+
+        // 验证所有 keys 都能找到
+        for i in 0..40u8 {
+            let key = make_dispersed_key(i);
+            let result = tree.lookup(&key).unwrap();
+            assert!(
+                result.is_some(),
+                "Key {} not found after overflow",
+                i
+            );
+            assert_eq!(
+                result.unwrap(),
+                format!("value{}", i).into_bytes(),
+                "Value mismatch for key {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_many_keys_large_scale() {
+        // 插入 100 个 keys 来更彻底地测试 overflow 处理
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        for i in 0..100u8 {
+            let key = make_dispersed_key(i);
+            let value = format!("value{}", i).into_bytes();
+            tree.insert(&key, value, 1).unwrap();
+        }
+
+        // 验证所有 keys
+        for i in 0..100u8 {
+            let key = make_dispersed_key(i);
+            let result = tree.lookup(&key).unwrap();
+            assert!(result.is_some(), "Key {} not found", i);
+        }
+    }
+
+    #[test]
+    fn test_insert_update_after_overflow() {
+        // 先触发 overflow，然后更新已存在的 key
+        let store = MemoryNodeStore::new();
+        let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
+
+        // 插入 50 个 keys
+        for i in 0..50u8 {
+            let key = make_dispersed_key(i);
+            let value = format!("original{}", i).into_bytes();
+            tree.insert(&key, value, 1).unwrap();
+        }
+
+        // 更新其中一些 keys
+        for i in (0..50u8).step_by(5) {
+            let key = make_dispersed_key(i);
+            let value = format!("updated{}", i).into_bytes();
+            tree.insert(&key, value, 2).unwrap();
+        }
+
+        // 验证更新
+        for i in 0..50u8 {
+            let key = make_dispersed_key(i);
+            let result = tree.lookup(&key).unwrap();
+            assert!(result.is_some(), "Key {} not found", i);
+            let expected = if i % 5 == 0 {
+                format!("updated{}", i).into_bytes()
+            } else {
+                format!("original{}", i).into_bytes()
+            };
+            assert_eq!(result.unwrap(), expected);
+        }
     }
 }

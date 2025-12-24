@@ -243,10 +243,13 @@ impl ChildRef {
         }
     }
 
-    /// 获取子节点的高度（叶子节点固定为 1）
+    /// 获取子节点的高度（叶子数据固定为 0，与 C++ 语义一致）
+    ///
+    /// C++ 语义：ChildPointer.getHeight() = isLeaf() ? 0 : getNode()->mHeight
+    #[allow(dead_code)]
     pub fn height_if_leaf(&self) -> Option<u8> {
         match self {
-            ChildRef::Leaf(_) => Some(1),
+            ChildRef::Leaf(_) => Some(0),
             ChildRef::Internal(_) => None,
         }
     }
@@ -310,11 +313,17 @@ impl BiNode {
         }
     }
 
-    /// 创建包含两个叶子的节点
+    /// 创建包含两个 entry 的节点
     ///
-    /// 根据 BiNode 信息创建一个新的 PersistentHOTNode
+    /// 根据 BiNode 信息创建一个新的 PersistentHOTNode。
+    /// 用于 Intermediate Node Creation 场景。
+    ///
+    /// # Height
+    ///
+    /// 返回节点的 height = bi_node.height
+    /// BiNode.height 已经表示"实体化后节点的高度"（子节点高度 + 1）
     pub fn to_two_entry_node(&self) -> PersistentHOTNode {
-        let mut node = PersistentHOTNode::empty(self.height + 1);
+        let mut node = PersistentHOTNode::empty(self.height);
         node.extraction_masks = PersistentHOTNode::masks_from_bits(&[self.discriminative_bit]);
         // left (bit=0) 放前面，sparse_key = 0
         // right (bit=1) 放后面，sparse_key = 1
@@ -960,6 +969,112 @@ impl PersistentHOTNode {
     }
 
     // ========================================================================
+    // Parent Pull Up
+    // ========================================================================
+
+    /// 将 BiNode 集成到当前节点（Parent Pull Up 操作）
+    ///
+    /// 这是 Parent Pull Up 的核心操作：将 split 后的两个子节点（BiNode）
+    /// 集成到父节点中，替换原来的单个 child entry。
+    ///
+    /// # 参数
+    ///
+    /// - `old_child_index`: 原 child 在父节点中的索引（将被替换为 left）
+    /// - `bi_node`: Split 产生的 BiNode，包含 left/right 子节点
+    ///
+    /// # 操作
+    ///
+    /// 1. 如果 `bi_node.discriminative_bit` 是新 bit：
+    ///    - 添加到 extraction_masks
+    ///    - PDEP 重编码所有现有 sparse_partial_keys
+    /// 2. 替换 old_child_index 为 left（bit=0）
+    /// 3. 在正确位置插入 right（bit=1），保持升序
+    ///
+    /// # 返回
+    ///
+    /// 新的 PersistentHOTNode，可能比原节点多一个 entry
+    pub fn with_integrated_binode(
+        &self,
+        old_child_index: usize,
+        bi_node: &BiNode,
+    ) -> PersistentHOTNode {
+        debug_assert!(old_child_index < self.len(), "old_child_index out of bounds");
+        debug_assert!(
+            self.len() < 32,
+            "Cannot integrate BiNode into full node (would have 33 entries)"
+        );
+
+        let mut new_node = self.clone();
+        let new_bit = bi_node.discriminative_bit;
+
+        // Step 1: 检查是否需要添加新的 discriminative bit
+        let bit_chunk = (new_bit / 64) as usize;
+        let bit_in_chunk = new_bit % 64;
+        let u64_bit_pos = 63 - bit_in_chunk; // MSB-first 转换
+        let bit_mask = 1u64 << u64_bit_pos;
+        let is_new_bit = (new_node.extraction_masks[bit_chunk] & bit_mask) == 0;
+
+        // Step 2: 如果是新 bit，更新 extraction_masks 并重编码 sparse keys
+        let new_bit_mask: u32 = if is_new_bit {
+            // 先添加到 extraction_masks（这样 get_mask_for_bit 才能工作）
+            new_node.extraction_masks[bit_chunk] |= bit_mask;
+
+            // 获取新 bit 在 sparse key 中的 mask
+            let new_bit_mask = new_node.get_mask_for_bit(new_bit);
+
+            // 基于 mask 计算 PDEP deposit mask
+            // deposit_mask 的作用：在 new_bit_mask 位置留一个 0，其余保持
+            let old_all_bits = self.get_all_mask_bits();
+            let low_mask = new_bit_mask - 1; // new_bit_mask 之前的位
+            let high_mask = old_all_bits & !low_mask; // new_bit_mask 及之后的位
+            let deposit_mask = (high_mask << 1) | low_mask;
+
+            // 使用 PDEP 重编码所有现有 sparse keys
+            for i in 0..new_node.len() {
+                new_node.sparse_partial_keys[i] =
+                    crate::bits::pdep32(new_node.sparse_partial_keys[i], deposit_mask);
+            }
+
+            new_bit_mask
+        } else {
+            // bit 已存在，直接获取其 mask
+            new_node.get_mask_for_bit(new_bit)
+        };
+
+        // Step 3: 计算 left 和 right 的 sparse keys
+        let old_sparse = new_node.sparse_partial_keys[old_child_index];
+        // left: bit = 0，保持原值（PDEP 已在该位置填 0）
+        let left_sparse = old_sparse;
+        // right: bit = 1，设置新 bit
+        let right_sparse = old_sparse | new_bit_mask;
+
+        // Step 4: 替换 old_child_index 为 left
+        new_node.sparse_partial_keys[old_child_index] = left_sparse;
+        new_node.children[old_child_index] = ChildRef::Internal(bi_node.left.clone());
+
+        // Step 5: 找到 right 的插入位置（保持升序）
+        let insert_pos = new_node.find_insert_position(right_sparse);
+
+        // Step 6: 插入 right entry
+        // 6a. 移动 sparse_partial_keys（固定数组，手动移动）
+        let old_len = new_node.len();
+        for i in (insert_pos..old_len).rev() {
+            new_node.sparse_partial_keys[i + 1] = new_node.sparse_partial_keys[i];
+        }
+        new_node.sparse_partial_keys[insert_pos] = right_sparse;
+
+        // 6b. 插入 child（Vec::insert 自动处理）
+        new_node.children.insert(insert_pos, ChildRef::Internal(bi_node.right.clone()));
+
+        // 更新 height：bi_node.height 已经是"实体化节点高度"（= 子节点高度 + 1）
+        // 父节点 height = max(原 height, bi_node.height)
+        // 在 Parent Pull Up 条件下（bi_node.height == parent.height），父节点高度不变
+        new_node.height = std::cmp::max(new_node.height, bi_node.height);
+
+        new_node
+    }
+
+    // ========================================================================
     // 序列化
     // ========================================================================
 
@@ -1194,7 +1309,7 @@ mod tests {
         assert!(leaf.is_leaf());
         assert!(!leaf.is_internal());
         assert_eq!(leaf.node_id(), &id);
-        assert_eq!(leaf.height_if_leaf(), Some(1));
+        assert_eq!(leaf.height_if_leaf(), Some(0)); // C++ 语义：leaf height = 0
 
         let internal = ChildRef::Internal(id);
         assert!(!internal.is_leaf());
