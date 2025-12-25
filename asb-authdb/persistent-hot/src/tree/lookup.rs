@@ -33,7 +33,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             .get_node(node_id)?
             .ok_or(StoreError::NotFound)?;
 
-        match node.search(key) {
+        let search_result = node.search(key);
+
+        match search_result {
             SearchResult::Found { index } => {
                 let child = &node.children[index];
                 match child {

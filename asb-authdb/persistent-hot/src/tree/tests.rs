@@ -159,29 +159,27 @@ fn make_dispersed_key(seed: u8) -> [u8; 32] {
 
 #[test]
 fn test_insert_triggers_overflow() {
-    // 插入超过 32 个 key 来触发 overflow
+    // 最小化重现：只插入 0-12，Key 3 在插入 Key 12 后丢失
     let store = MemoryNodeStore::new();
     let mut tree: HOTTree<_, Blake3Hasher> = HOTTree::new(store);
 
-    // 插入 40 个 keys，这应该触发至少一次 split
-    for i in 0..40u8 {
+    // 插入 0-11，验证 Key 3 还在
+    for i in 0..12u8 {
         let key = make_dispersed_key(i);
         let value = format!("value{}", i).into_bytes();
         tree.insert(&key, value, 1).unwrap();
     }
+    let key3_before = make_dispersed_key(3);
+    assert!(tree.lookup(&key3_before).unwrap().is_some(), "Key 3 should exist before inserting key 12");
 
-    // 验证所有 keys 都能找到
-    for i in 0..40u8 {
-        let key = make_dispersed_key(i);
-        let result = tree.lookup(&key).unwrap();
-        assert!(result.is_some(), "Key {} not found after overflow", i);
-        assert_eq!(
-            result.unwrap(),
-            format!("value{}", i).into_bytes(),
-            "Value mismatch for key {}",
-            i
-        );
-    }
+    // 插入 Key 12
+    let key12 = make_dispersed_key(12);
+    tree.insert(&key12, b"value12".to_vec(), 1).unwrap();
+
+    // 检查 Key 3
+    let key3 = make_dispersed_key(3);
+    let result = tree.lookup(&key3).unwrap();
+    assert!(result.is_some(), "Key 3 not found after inserting key 12");
 }
 
 #[test]

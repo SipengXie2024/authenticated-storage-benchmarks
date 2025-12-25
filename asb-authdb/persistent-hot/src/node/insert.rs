@@ -120,6 +120,7 @@ impl PersistentHOTNode {
         let is_new_bit = (new_node.extraction_masks[bit_chunk] & bit_mask) == 0;
 
         // Step 2: 如果是新 bit，更新 extraction_masks 并重编码 sparse keys
+        let mut deposit_mask: Option<u32> = None;
         let new_bit_mask: u32 = if is_new_bit {
             new_node.extraction_masks[bit_chunk] |= bit_mask;
             let new_bit_mask = new_node.get_mask_for_bit(new_bit);
@@ -128,12 +129,13 @@ impl PersistentHOTNode {
             let old_all_bits = self.get_all_mask_bits();
             let low_mask = new_bit_mask - 1;
             let high_mask = old_all_bits & !low_mask;
-            let deposit_mask = (high_mask << 1) | low_mask;
+            let deposit_mask_value = (high_mask << 1) | low_mask;
+            deposit_mask = Some(deposit_mask_value);
 
             // 使用 PDEP 重编码所有现有 sparse keys
             for i in 0..new_node.len() {
                 new_node.sparse_partial_keys[i] =
-                    pdep32(new_node.sparse_partial_keys[i], deposit_mask);
+                    pdep32(new_node.sparse_partial_keys[i], deposit_mask_value);
             }
 
             new_bit_mask
@@ -159,16 +161,24 @@ impl PersistentHOTNode {
         }
 
         // Step 4: 计算新 entry 的 sparse partial key
-        // 基于 subtree_prefix + new_bit_value
-        let base_sparse = new_node.sparse_partial_keys[info.first_index_in_affected_subtree];
+        // 基于 subtree_prefix + new_bit_value（对齐 C++ addEntry）
+        let base_prefix = match deposit_mask {
+            Some(mask) => pdep32(info.subtree_prefix_partial_key, mask),
+            None => info.subtree_prefix_partial_key,
+        };
         let new_sparse_key = if info.new_bit_value {
-            base_sparse | new_bit_mask
+            base_prefix | new_bit_mask
         } else {
-            base_sparse & !new_bit_mask
+            base_prefix & !new_bit_mask
         };
 
-        // Step 5: 找到插入位置（保持 sparse keys 升序）
-        let insert_pos = new_node.find_insert_position(new_sparse_key);
+        // Step 5: 计算插入位置（affected subtree 边界）
+        let insert_pos = info.first_index_in_affected_subtree
+            + if info.new_bit_value {
+                info.number_entries_in_affected_subtree
+            } else {
+                0
+            };
 
         // Step 6: 插入新 entry
         let old_len = new_node.len();

@@ -2,7 +2,7 @@
 
 use crate::hash::Hasher;
 use crate::node::{
-    extract_bit, find_first_differing_bit, InsertInformation, LeafData, NodeId,
+    extract_bit, find_first_differing_bit, BiNode, InsertInformation, LeafData, NodeId,
     PersistentHOTNode, SearchResult,
 };
 use crate::store::{NodeStore, Result, StoreError};
@@ -119,16 +119,19 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     if is_single_entry && is_leaf_entry {
                         // ===== CASE 1: Leaf Node Pushdown =====
                         // 受影响子树只有一个 entry，且是叶子（child_ref 已经是 NodeId::Leaf）
-                        let new_child_id = self.leaf_pushdown(
-                            &node,
+                        // 对应 C++ integrateBiNodeIntoTree: 根据 height 判断 Parent Pull Up 或 Intermediate Node Creation
+                        return self.leaf_pushdown_with_height_check(
+                            &mut stack,
+                            current_id,
+                            node,
                             index,
+                            diff_bit,
                             &affected_key,
                             child_ref, // child_ref 是 NodeId::Leaf
                             key,
                             leaf_id,
                             version,
-                        )?;
-                        return self.propagate_pointer_updates(stack, new_child_id, version);
+                        );
                     } else if is_single_entry {
                         // ===== CASE 2: 递归进入子节点 =====
                         // 受影响子树只有一个 entry，但是内部节点（child_ref 是 NodeId::Internal）
@@ -173,38 +176,117 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         }
     }
 
-    /// Leaf Node Pushdown: 创建新节点容纳两个叶子
-    pub(super) fn leaf_pushdown(
+    /// Leaf Node Pushdown（对齐 C++ integrateBiNodeIntoTree）
+    ///
+    /// 根据 height 判断策略：
+    /// - `parent.height > bi_node.height` → Intermediate Node Creation
+    /// - `parent.height == bi_node.height` → Parent Pull Up（直接在父节点添加 entry）
+    ///
+    /// # C++ 对应
+    ///
+    /// ```cpp
+    /// if(existingParentNode->mHeight > splitEntries.mHeight) {
+    ///     // Intermediate Node Creation
+    ///     *insertStack[currentDepth].mChildPointer = createTwoEntriesNode(splitEntries);
+    /// } else {
+    ///     // Parent Pull Up
+    ///     parentNode.addEntry(insertInformation, valueToInsert);
+    /// }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn leaf_pushdown_with_height_check(
         &mut self,
-        parent_node: &PersistentHOTNode,
+        stack: &mut Vec<InsertStackEntry>,
+        current_id: NodeId,
+        parent_node: PersistentHOTNode,
         affected_index: usize,
+        diff_bit: u16,
         existing_key: &[u8; 32],
         existing_leaf_id: NodeId,
         new_key: &[u8; 32],
         new_leaf_id: NodeId,
         version: u64,
-    ) -> Result<NodeId> {
-        // 创建包含两个叶子的新节点
-        let new_child = PersistentHOTNode::two_leaves(
-            existing_key,
-            existing_leaf_id,
-            new_key,
-            new_leaf_id,
-        );
-        let new_child_id = new_child.compute_node_id::<H>(version);
-        self.store.put_node(&new_child_id, &new_child)?;
+    ) -> Result<()> {
+        // BiNode 高度 = max(leaf_height, leaf_height) + 1 = max(0, 0) + 1 = 1
+        let bi_node_height: u8 = 1;
 
-        // 更新父节点：将叶子替换为内部节点
-        let mut new_parent = parent_node.clone();
-        new_parent.children[affected_index] = new_child_id;
+        // C++ integrateBiNodeIntoTree 的 height 判断
+        if parent_node.height > bi_node_height {
+            // ===== Intermediate Node Creation =====
+            // parent.height > 1: 创建包含两个叶子的中间节点
+            let new_child = PersistentHOTNode::two_leaves(
+                existing_key,
+                existing_leaf_id,
+                new_key,
+                new_leaf_id,
+            );
+            let new_child_id = new_child.compute_node_id::<H>(version);
+            self.store.put_node(&new_child_id, &new_child)?;
 
-        // 更新父节点高度
-        new_parent.height = std::cmp::max(parent_node.height, new_child.height + 1);
+            // 更新父节点：将叶子替换为内部节点
+            let mut new_parent = parent_node.clone();
+            new_parent.children[affected_index] = new_child_id;
+            // 高度不变（因为有 height gap）
 
-        let new_parent_id = new_parent.compute_node_id::<H>(version);
-        self.store.put_node(&new_parent_id, &new_parent)?;
+            let new_parent_id = new_parent.compute_node_id::<H>(version);
+            self.store.put_node(&new_parent_id, &new_parent)?;
+            self.propagate_pointer_updates(std::mem::take(stack), new_parent_id, version)
+        } else {
+            // ===== Parent Pull Up =====
+            // parent.height == 1: 直接在父节点添加新 entry
+            //
+            // 对齐 C++ integrateBiNodeIntoTree：
+            // - newIsRight=true -> 插入 BiNode.right
+            // - entryIndex 位置替换为 BiNode.left
 
-        Ok(new_parent_id)
+            if parent_node.len() < 32 {
+                // 父节点未满：两步操作
+                let bi_node = BiNode::from_existing_and_new(
+                    diff_bit,
+                    existing_key,
+                    existing_leaf_id,
+                    new_leaf_id,
+                    bi_node_height,
+                );
+
+                // newIsRight=true：使用 bit=1 生成 InsertInformation
+                let insert_info = parent_node.get_insert_information(affected_index, diff_bit, true);
+                let mut new_node = parent_node.with_new_entry_from_info(&insert_info, bi_node.right);
+
+                // entryOffset=0：替换 entryIndex 位置
+                new_node.children[affected_index] = bi_node.left;
+
+                let new_node_id = new_node.compute_node_id::<H>(version);
+                self.store.put_node(&new_node_id, &new_node)?;
+                self.propagate_pointer_updates(std::mem::take(stack), new_node_id, version)
+            } else {
+                // 父节点已满：创建 BiNode 并向上处理 overflow
+                // 对应 C++ integrateBiNodeIntoTree 中 parentNode.isFull() 分支
+                let mut bi_node = BiNode::from_existing_and_new(
+                    diff_bit,
+                    existing_key,
+                    existing_leaf_id.clone(),
+                    new_leaf_id.clone(),
+                    bi_node_height,
+                );
+
+                // 把当前节点 push 到 stack，然后调用 integrate_binode_upwards
+                stack.push(InsertStackEntry {
+                    node_id: current_id,
+                    child_index: affected_index,
+                    node: parent_node,
+                });
+
+                let result_id = self.integrate_binode_upwards(stack, &mut bi_node, version)?;
+
+                // integrate_binode_upwards 已经处理了 root_id 更新，直接返回
+                if self.root_id.as_ref() == Some(&result_id) {
+                    Ok(())
+                } else {
+                    self.propagate_pointer_updates(std::mem::take(stack), result_id, version)
+                }
+            }
+        }
     }
 
     /// Normal Insert: 在当前节点添加新 entry
