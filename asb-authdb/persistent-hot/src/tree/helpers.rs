@@ -1,7 +1,7 @@
 //! 辅助函数
 
 use crate::hash::Hasher;
-use crate::node::{ChildRef, NodeId, PersistentHOTNode};
+use crate::node::{NodeId, PersistentHOTNode};
 use crate::store::{NodeStore, Result, StoreError};
 
 use super::core::{HOTTree, InsertStackEntry};
@@ -19,7 +19,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         while let Some(entry) = stack.pop() {
             // 更新父节点的 child 引用
             let mut new_node = entry.node.clone();
-            new_node.children[entry.child_index] = ChildRef::Internal(new_child_id.clone());
+            new_node.children[entry.child_index] = new_child_id;
 
             // 读取新子节点获取高度（用于维护 height 不变量）
             if let Ok(Some(child)) = self.store.get_node(&new_child_id) {
@@ -57,20 +57,20 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     }
 
     /// 获取 entry 对应的 key
-    pub(super) fn get_entry_key(&self, child: &ChildRef) -> Result<[u8; 32]> {
+    pub(super) fn get_entry_key(&self, child: &NodeId) -> Result<[u8; 32]> {
         match child {
-            ChildRef::Leaf(leaf_id) => {
+            NodeId::Leaf(_) => {
                 let leaf = self
                     .store
-                    .get_leaf(leaf_id)?
+                    .get_leaf(child)?
                     .ok_or(StoreError::NotFound)?;
                 Ok(leaf.key)
             }
-            ChildRef::Internal(node_id) => {
+            NodeId::Internal(_) => {
                 // 对于内部节点，递归获取第一个叶子的 key
                 let node = self
                     .store
-                    .get_node(node_id)?
+                    .get_node(child)?
                     .ok_or(StoreError::NotFound)?;
                 if node.len() > 0 {
                     self.get_entry_key(&node.children[0])

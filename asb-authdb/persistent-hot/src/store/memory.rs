@@ -69,6 +69,10 @@ impl Clone for MemoryNodeStore {
 
 impl NodeStore for MemoryNodeStore {
     fn get_node(&self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
+        debug_assert!(
+            id.is_internal(),
+            "get_node requires NodeId::Internal, got Leaf"
+        );
         let nodes = self.nodes.read().unwrap();
         match nodes.get(id) {
             Some(bytes) => {
@@ -81,6 +85,10 @@ impl NodeStore for MemoryNodeStore {
     }
 
     fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
+        debug_assert!(
+            id.is_internal(),
+            "put_node requires NodeId::Internal, got Leaf"
+        );
         let bytes = node
             .to_bytes()
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
@@ -89,6 +97,10 @@ impl NodeStore for MemoryNodeStore {
     }
 
     fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>> {
+        debug_assert!(
+            id.is_leaf(),
+            "get_leaf requires NodeId::Leaf, got Internal"
+        );
         let leaves = self.leaves.read().unwrap();
         match leaves.get(id) {
             Some(bytes) => {
@@ -101,6 +113,10 @@ impl NodeStore for MemoryNodeStore {
     }
 
     fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()> {
+        debug_assert!(
+            id.is_leaf(),
+            "put_leaf requires NodeId::Leaf, got Internal"
+        );
         let bytes = leaf
             .to_bytes()
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;

@@ -1,7 +1,7 @@
 //! 插入操作（Copy-on-Write）
 
 use super::core::PersistentHOTNode;
-use super::types::{ChildRef, InsertInformation};
+use super::types::{InsertInformation, NodeId};
 use crate::bits::pdep32;
 
 impl PersistentHOTNode {
@@ -13,7 +13,7 @@ impl PersistentHOTNode {
     /// - `new_bit`: 新的 discriminative bit 位置（0-255）
     /// - `new_bit_value`: 新 key 在该 bit 位置的值（true=1, false=0）
     /// - `affected_index`: 受影响的 entry index（与新 key 共享前缀）
-    /// - `child`: 新的 ChildRef（叶子或内部节点）
+    /// - `child`: 新的 NodeId（叶子或内部节点）
     ///
     /// # Panics
     /// - 如果节点已满（debug 模式）
@@ -22,7 +22,7 @@ impl PersistentHOTNode {
         new_bit: u16,
         new_bit_value: bool,
         affected_index: usize,
-        child: ChildRef,
+        child: NodeId,
     ) -> Self {
         debug_assert!(!self.is_full(), "Cannot add entry to full node");
         debug_assert!(affected_index < self.len(), "affected_index out of bounds");
@@ -105,8 +105,8 @@ impl PersistentHOTNode {
     /// # 参数
     ///
     /// - `info`: InsertInformation，包含 affected_subtree_mask
-    /// - `child`: 新 entry 的 child 引用
-    pub fn with_new_entry_from_info(&self, info: &InsertInformation, child: ChildRef) -> Self {
+    /// - `child`: 新 entry 的 NodeId（叶子或内部节点）
+    pub fn with_new_entry_from_info(&self, info: &InsertInformation, child: NodeId) -> Self {
         debug_assert!(!self.is_full(), "Cannot add entry to full node");
 
         let mut new_node = self.clone();

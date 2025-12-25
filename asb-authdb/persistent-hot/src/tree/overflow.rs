@@ -2,7 +2,7 @@
 
 use crate::hash::Hasher;
 use crate::node::{
-    extract_bit, find_first_differing_bit, BiNode, ChildRef, InsertInformation, NodeId,
+    extract_bit, find_first_differing_bit, BiNode, InsertInformation, NodeId,
     PersistentHOTNode, SearchResult,
 };
 use crate::store::{NodeStore, Result};
@@ -151,7 +151,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 }
 
                 // 使用 with_new_entry_from_info 添加 entry
-                let new_node = node.with_new_entry_from_info(&new_info, ChildRef::Leaf(leaf_id));
+                let new_node = node.with_new_entry_from_info(&new_info, leaf_id);
                 let new_node_id = new_node.compute_node_id::<H>(version);
                 self.store.put_node(&new_node_id, &new_node)?;
                 Ok(new_node_id)
@@ -216,7 +216,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     diff_bit,
                     new_bit_value,
                     affected_index,
-                    ChildRef::Leaf(leaf_id),
+                    leaf_id,
                 );
                 let new_node_id = new_node.compute_node_id::<H>(version);
                 self.store.put_node(&new_node_id, &new_node)?;
@@ -286,8 +286,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 self.store.put_node(&intermediate_id, &intermediate)?;
 
                 let mut new_parent = parent.clone();
-                new_parent.children[parent_entry.child_index] =
-                    ChildRef::Internal(intermediate_id.clone());
+                new_parent.children[parent_entry.child_index] = intermediate_id;
                 new_parent.height = std::cmp::max(new_parent.height, intermediate.height + 1);
 
                 let new_parent_id = new_parent.compute_node_id::<H>(version);
@@ -446,8 +445,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
                 // 更新父节点的 child 引用
                 let mut new_parent = parent.clone();
-                new_parent.children[parent_entry.child_index] =
-                    ChildRef::Internal(intermediate_id.clone());
+                new_parent.children[parent_entry.child_index] = intermediate_id;
 
                 // 更新父节点高度
                 new_parent.height = std::cmp::max(new_parent.height, intermediate.height + 1);

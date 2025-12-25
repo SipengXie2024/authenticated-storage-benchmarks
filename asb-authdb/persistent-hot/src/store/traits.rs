@@ -9,10 +9,10 @@ use crate::node::{LeafData, NodeId, PersistentHOTNode};
 ///
 /// # 核心操作
 ///
-/// - `get_node`: 根据 NodeId 获取内部节点
-/// - `put_node`: 存储内部节点
-/// - `get_leaf`: 根据 NodeId 获取叶子数据
-/// - `put_leaf`: 存储叶子数据
+/// - `get_node`: 根据 NodeId::Internal 获取内部节点
+/// - `put_node`: 存储内部节点（id 必须是 NodeId::Internal）
+/// - `get_leaf`: 根据 NodeId::Leaf 获取叶子数据
+/// - `put_leaf`: 存储叶子数据（id 必须是 NodeId::Leaf）
 /// - `flush`: 刷新缓冲区到持久化存储
 ///
 /// # Content-Addressed 存储
@@ -21,8 +21,18 @@ use crate::node::{LeafData, NodeId, PersistentHOTNode};
 /// - 相同内容 + 相同 version 的节点具有相同的 NodeId
 /// - put_node/put_leaf 是幂等的
 /// - 节点一旦写入就不会改变（不可变）
+///
+/// # NodeId 类型区分
+///
+/// - `NodeId::Internal` → 存储 `PersistentHOTNode`
+/// - `NodeId::Leaf` → 存储 `LeafData`
+///
+/// 调用方必须使用正确类型的 NodeId 调用对应方法。
 pub trait NodeStore: Send + Sync {
     /// 获取内部节点
+    ///
+    /// # 参数
+    /// - `id`: 必须是 `NodeId::Internal`
     ///
     /// # 返回
     /// - `Ok(Some(node))`: 找到节点
@@ -32,15 +42,25 @@ pub trait NodeStore: Send + Sync {
 
     /// 存储内部节点
     ///
+    /// # 参数
+    /// - `id`: 必须是 `NodeId::Internal`
+    /// - `node`: 要存储的节点
+    ///
     /// # 注意
     /// - 调用者负责确保 `id` 是 `node` 内容的正确哈希
     /// - 由于 content-addressed 特性，重复写入相同节点是安全的
     fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()>;
 
     /// 获取叶子数据
+    ///
+    /// # 参数
+    /// - `id`: 必须是 `NodeId::Leaf`
     fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>>;
 
     /// 存储叶子数据
+    ///
+    /// # 参数
+    /// - `id`: 必须是 `NodeId::Leaf`
     fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()>;
 
     /// 刷新缓冲区

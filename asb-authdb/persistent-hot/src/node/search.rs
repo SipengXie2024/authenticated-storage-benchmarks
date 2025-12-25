@@ -1,7 +1,7 @@
 //! 搜索操作
 
 use super::core::PersistentHOTNode;
-use super::types::{ChildRef, SearchResult};
+use super::types::{NodeId, SearchResult};
 use crate::bits::pext64;
 use crate::simd::{simd_search, SimdSearchResult};
 
@@ -61,7 +61,7 @@ impl PersistentHOTNode {
     }
 
     /// 搜索并返回 child
-    pub fn search_child(&self, key: &[u8; 32]) -> Option<&ChildRef> {
+    pub fn search_child(&self, key: &[u8; 32]) -> Option<&NodeId> {
         match self.search(key) {
             SearchResult::Found { index } => Some(&self.children[index]),
             SearchResult::NotFound { .. } => None,

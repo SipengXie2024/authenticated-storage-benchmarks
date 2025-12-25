@@ -64,10 +64,14 @@ impl KvNodeStore {
     ///
     /// Key 格式：`[0x00][version_id: 8B][node_id: 40B]` = 49 bytes
     fn make_node_key(&self, node_id: &NodeId) -> [u8; 49] {
+        debug_assert!(
+            node_id.is_internal(),
+            "make_node_key requires NodeId::Internal"
+        );
         let mut key = [0u8; 49];
         key[0] = KEY_PREFIX_NODE;
         key[1..9].copy_from_slice(&self.version_id.to_be_bytes());
-        key[9..49].copy_from_slice(node_id);
+        key[9..49].copy_from_slice(node_id.raw_bytes());
         key
     }
 
@@ -75,10 +79,14 @@ impl KvNodeStore {
     ///
     /// Key 格式：`[0x01][version_id: 8B][node_id: 40B]` = 49 bytes
     fn make_leaf_key(&self, node_id: &NodeId) -> [u8; 49] {
+        debug_assert!(
+            node_id.is_leaf(),
+            "make_leaf_key requires NodeId::Leaf"
+        );
         let mut key = [0u8; 49];
         key[0] = KEY_PREFIX_LEAF;
         key[1..9].copy_from_slice(&self.version_id.to_be_bytes());
-        key[9..49].copy_from_slice(node_id);
+        key[9..49].copy_from_slice(node_id.raw_bytes());
         key
     }
 }

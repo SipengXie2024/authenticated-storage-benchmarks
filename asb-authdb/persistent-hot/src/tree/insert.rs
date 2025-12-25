@@ -2,7 +2,7 @@
 
 use crate::hash::Hasher;
 use crate::node::{
-    extract_bit, find_first_differing_bit, ChildRef, InsertInformation, LeafData, NodeId,
+    extract_bit, find_first_differing_bit, InsertInformation, LeafData, NodeId,
     PersistentHOTNode, SearchResult,
 };
 use crate::store::{NodeStore, Result, StoreError};
@@ -75,7 +75,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             match node.search(key) {
                 SearchResult::Found { index } => {
                     // 先提取需要的信息，避免借用冲突
-                    let child_ref = node.children[index].clone();
+                    let child_ref = node.children[index];
 
                     // 获取 affected entry 的 key 以计算 diff bit
                     let affected_key = self.get_entry_key(&child_ref)?;
@@ -84,22 +84,22 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     if &affected_key == key {
                         // 相同 key：替换值
                         match child_ref {
-                            ChildRef::Leaf(_) => {
+                            NodeId::Leaf(_) => {
                                 // 直接替换叶子
                                 let mut new_node = node.clone();
-                                new_node.children[index] = ChildRef::Leaf(leaf_id);
+                                new_node.children[index] = leaf_id;
                                 let new_node_id = new_node.compute_node_id::<H>(version);
                                 self.store.put_node(&new_node_id, &new_node)?;
                                 return self.propagate_pointer_updates(stack, new_node_id, version);
                             }
-                            ChildRef::Internal(child_id) => {
+                            NodeId::Internal(_) => {
                                 // 递归进入子节点替换
                                 stack.push(InsertStackEntry {
                                     node_id: current_id,
                                     child_index: index,
                                     node,
                                 });
-                                current_id = child_id;
+                                current_id = child_ref;
                                 continue;
                             }
                         }
@@ -114,35 +114,31 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     // 对应 C++ getInsertInformation + isSingleEntry 检查
                     let insert_info = node.get_insert_information(index, diff_bit, new_bit_value);
                     let is_single_entry = insert_info.is_single_entry();
-                    let is_leaf_entry = matches!(child_ref, ChildRef::Leaf(_));
+                    let is_leaf_entry = child_ref.is_leaf();
 
                     if is_single_entry && is_leaf_entry {
                         // ===== CASE 1: Leaf Node Pushdown =====
-                        // 受影响子树只有一个 entry，且是叶子
-                        if let ChildRef::Leaf(existing_leaf_id) = child_ref {
-                            let new_child_id = self.leaf_pushdown(
-                                &node,
-                                index,
-                                &affected_key,
-                                existing_leaf_id,
-                                key,
-                                leaf_id,
-                                version,
-                            )?;
-                            return self.propagate_pointer_updates(stack, new_child_id, version);
-                        }
+                        // 受影响子树只有一个 entry，且是叶子（child_ref 已经是 NodeId::Leaf）
+                        let new_child_id = self.leaf_pushdown(
+                            &node,
+                            index,
+                            &affected_key,
+                            child_ref, // child_ref 是 NodeId::Leaf
+                            key,
+                            leaf_id,
+                            version,
+                        )?;
+                        return self.propagate_pointer_updates(stack, new_child_id, version);
                     } else if is_single_entry {
                         // ===== CASE 2: 递归进入子节点 =====
-                        // 受影响子树只有一个 entry，但是内部节点
-                        if let ChildRef::Internal(child_id) = child_ref {
-                            stack.push(InsertStackEntry {
-                                node_id: current_id,
-                                child_index: index,
-                                node,
-                            });
-                            current_id = child_id;
-                            continue;
-                        }
+                        // 受影响子树只有一个 entry，但是内部节点（child_ref 是 NodeId::Internal）
+                        stack.push(InsertStackEntry {
+                            node_id: current_id,
+                            child_index: index,
+                            node,
+                        });
+                        current_id = child_ref;
+                        continue;
                     } else {
                         // ===== CASE 3: Normal Insert =====
                         // 受影响子树有多个 entries，在当前节点添加新 entry
@@ -157,9 +153,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         )?;
                         return self.propagate_pointer_updates(stack, new_node_id, version);
                     }
-
-                    // 应该不会到达这里
-                    unreachable!("All cases should be handled above");
                 }
                 SearchResult::NotFound { dense_key } => {
                     // 没有匹配的 entry：需要添加新 entry
@@ -203,7 +196,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // 更新父节点：将叶子替换为内部节点
         let mut new_parent = parent_node.clone();
-        new_parent.children[affected_index] = ChildRef::Internal(new_child_id.clone());
+        new_parent.children[affected_index] = new_child_id;
 
         // 更新父节点高度
         new_parent.height = std::cmp::max(parent_node.height, new_child.height + 1);
@@ -254,7 +247,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // 使用 with_new_entry_from_info 创建新节点
         // 这会正确更新 affected subtree 中所有 entries 的 sparse key
-        let new_node = node.with_new_entry_from_info(insert_info, ChildRef::Leaf(leaf_id));
+        let new_node = node.with_new_entry_from_info(insert_info, leaf_id);
 
         let new_node_id = new_node.compute_node_id::<H>(version);
         self.store.put_node(&new_node_id, &new_node)?;
@@ -304,7 +297,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             diff_bit,
             new_bit_value,
             affected_index,
-            ChildRef::Leaf(leaf_id),
+            leaf_id,
         );
 
         let new_node_id = new_node.compute_node_id::<H>(version);

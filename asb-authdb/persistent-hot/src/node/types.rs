@@ -1,6 +1,6 @@
 //! 节点核心类型定义
 //!
-//! 包含 NodeId、SearchResult、LeafData、ChildRef、InsertInformation、BiNode
+//! 包含 NodeId、SearchResult、LeafData、InsertInformation、BiNode
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -12,10 +12,10 @@ use crate::hash::Hasher;
 // NodeId
 // ============================================================================
 
-/// NodeId 大小：8 字节 version + 32 字节 content hash
+/// NodeId 裸字节大小：8 字节 version + 32 字节 content hash
 pub const NODE_ID_SIZE: usize = 40;
 
-/// 节点标识符：版本 + 内容哈希
+/// 节点标识符（区分 Leaf/Internal）
 ///
 /// 格式：`[version: 8 bytes big-endian][content_hash: 32 bytes]`
 ///
@@ -24,27 +24,150 @@ pub const NODE_ID_SIZE: usize = 40;
 /// - 历史查询：支持查询特定版本的状态
 /// - 垃圾回收：根据 version 判断数据是否可回收
 /// - 冲突检测：同一 content hash 不同 version 是不同数据
-pub type NodeId = [u8; NODE_ID_SIZE];
+///
+/// 高度语义（对齐 C++）：
+/// - `NodeId::Leaf`: 高度 = 0
+/// - `NodeId::Internal`: 高度 ≥ 1
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeId {
+    /// 叶子节点（关联 LeafData，高度 = 0）
+    Leaf([u8; NODE_ID_SIZE]),
+    /// 内部节点（关联 PersistentHOTNode，高度 ≥ 1）
+    Internal([u8; NODE_ID_SIZE]),
+}
 
-/// 从 version 和 content hash 构造 NodeId
+impl NodeId {
+    /// 创建 Leaf NodeId
+    #[inline]
+    pub fn leaf(version: u64, content_hash: &[u8; 32]) -> Self {
+        NodeId::Leaf(make_raw_id(version, content_hash))
+    }
+
+    /// 创建 Internal NodeId
+    #[inline]
+    pub fn internal(version: u64, content_hash: &[u8; 32]) -> Self {
+        NodeId::Internal(make_raw_id(version, content_hash))
+    }
+
+    /// 检查是否为叶子节点
+    #[inline]
+    pub fn is_leaf(&self) -> bool {
+        matches!(self, NodeId::Leaf(_))
+    }
+
+    /// 检查是否为内部节点
+    #[inline]
+    pub fn is_internal(&self) -> bool {
+        matches!(self, NodeId::Internal(_))
+    }
+
+    /// 获取裸字节引用
+    #[inline]
+    pub fn raw_bytes(&self) -> &[u8; NODE_ID_SIZE] {
+        match self {
+            NodeId::Leaf(id) | NodeId::Internal(id) => id,
+        }
+    }
+
+    /// 获取 version
+    #[inline]
+    pub fn version(&self) -> u64 {
+        u64::from_be_bytes(self.raw_bytes()[0..8].try_into().unwrap())
+    }
+
+    /// 获取 content hash
+    #[inline]
+    pub fn content_hash(&self) -> [u8; 32] {
+        self.raw_bytes()[8..40].try_into().unwrap()
+    }
+
+    /// 获取高度（Leaf = 0，Internal 需要查询 store）
+    #[inline]
+    pub fn height_if_leaf(&self) -> Option<u8> {
+        match self {
+            NodeId::Leaf(_) => Some(0),
+            NodeId::Internal(_) => None,
+        }
+    }
+}
+
+// 手动实现 Serialize/Deserialize（1 byte discriminant + 40 bytes）
+impl Serialize for NodeId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(NODE_ID_SIZE + 1)?;
+        match self {
+            NodeId::Internal(id) => {
+                tuple.serialize_element(&0u8)?;
+                for byte in id.iter() {
+                    tuple.serialize_element(byte)?;
+                }
+            }
+            NodeId::Leaf(id) => {
+                tuple.serialize_element(&1u8)?;
+                for byte in id.iter() {
+                    tuple.serialize_element(byte)?;
+                }
+            }
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NodeIdVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NodeIdVisitor {
+            type Value = NodeId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a NodeId (discriminant + 40 bytes)")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let discriminant: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+
+                let mut raw_id = [0u8; NODE_ID_SIZE];
+                for i in 0..NODE_ID_SIZE {
+                    raw_id[i] = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i + 1, &self))?;
+                }
+
+                match discriminant {
+                    0 => Ok(NodeId::Internal(raw_id)),
+                    1 => Ok(NodeId::Leaf(raw_id)),
+                    _ => Err(serde::de::Error::custom(format!(
+                        "Invalid NodeId discriminant: {}",
+                        discriminant
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_tuple(NODE_ID_SIZE + 1, NodeIdVisitor)
+    }
+}
+
+/// 从 version 和 content hash 构造裸 ID 字节
 #[inline]
-pub fn make_node_id(version: u64, content_hash: &[u8; 32]) -> NodeId {
+pub fn make_raw_id(version: u64, content_hash: &[u8; 32]) -> [u8; NODE_ID_SIZE] {
     let mut id = [0u8; NODE_ID_SIZE];
     id[0..8].copy_from_slice(&version.to_be_bytes());
     id[8..40].copy_from_slice(content_hash);
     id
-}
-
-/// 从 NodeId 提取 version
-#[inline]
-pub fn node_id_version(id: &NodeId) -> u64 {
-    u64::from_be_bytes(id[0..8].try_into().unwrap())
-}
-
-/// 从 NodeId 提取 content hash
-#[inline]
-pub fn node_id_hash(id: &NodeId) -> [u8; 32] {
-    id[8..40].try_into().unwrap()
 }
 
 // ============================================================================
@@ -104,11 +227,11 @@ impl LeafData {
         Self { key, value }
     }
 
-    /// 计算 NodeId
+    /// 计算 NodeId（返回 NodeId::Leaf）
     pub fn compute_node_id<H: Hasher>(&self, version: u64) -> NodeId {
         let bytes = self.to_bytes().expect("LeafData serialization should never fail");
         let hash = H::hash(&bytes);
-        make_node_id(version, &hash)
+        NodeId::leaf(version, &hash)
     }
 
     /// 序列化为字节
@@ -119,126 +242,6 @@ impl LeafData {
     /// 从字节反序列化
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode_config().deserialize(bytes)
-    }
-}
-
-// ============================================================================
-// ChildRef
-// ============================================================================
-
-/// 子节点引用
-///
-/// 保留 Internal/Leaf 区分（类型安全，调试友好），
-/// 但都使用 NodeId 引用，叶子数据单独存储。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChildRef {
-    /// 内部节点引用
-    Internal(NodeId),
-    /// 叶子节点引用（指向单独存储的 LeafData）
-    Leaf(NodeId),
-}
-
-// 手动实现 Serialize/Deserialize（serde 默认不支持 [u8; 40]）
-impl Serialize for ChildRef {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeTuple;
-        // 格式：(discriminant: u8, node_id: [u8; 40])
-        let mut tuple = serializer.serialize_tuple(NODE_ID_SIZE + 1)?;
-        match self {
-            ChildRef::Internal(id) => {
-                tuple.serialize_element(&0u8)?;
-                for byte in id.iter() {
-                    tuple.serialize_element(byte)?;
-                }
-            }
-            ChildRef::Leaf(id) => {
-                tuple.serialize_element(&1u8)?;
-                for byte in id.iter() {
-                    tuple.serialize_element(byte)?;
-                }
-            }
-        }
-        tuple.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ChildRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ChildRefVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for ChildRefVisitor {
-            type Value = ChildRef;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a ChildRef (discriminant + 40 byte NodeId)")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let discriminant: u8 = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-
-                let mut node_id = [0u8; NODE_ID_SIZE];
-                for i in 0..NODE_ID_SIZE {
-                    node_id[i] = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(i + 1, &self))?;
-                }
-
-                match discriminant {
-                    0 => Ok(ChildRef::Internal(node_id)),
-                    1 => Ok(ChildRef::Leaf(node_id)),
-                    _ => Err(serde::de::Error::custom(format!(
-                        "Invalid ChildRef discriminant: {}",
-                        discriminant
-                    ))),
-                }
-            }
-        }
-
-        deserializer.deserialize_tuple(NODE_ID_SIZE + 1, ChildRefVisitor)
-    }
-}
-
-impl ChildRef {
-    /// 检查是否为叶子节点
-    #[inline]
-    pub fn is_leaf(&self) -> bool {
-        matches!(self, ChildRef::Leaf(_))
-    }
-
-    /// 检查是否为内部节点
-    #[inline]
-    pub fn is_internal(&self) -> bool {
-        matches!(self, ChildRef::Internal(_))
-    }
-
-    /// 获取 NodeId 引用
-    #[inline]
-    pub fn node_id(&self) -> &NodeId {
-        match self {
-            ChildRef::Internal(id) | ChildRef::Leaf(id) => id,
-        }
-    }
-
-    /// 获取子节点的高度（叶子数据固定为 0，与 C++ 语义一致）
-    ///
-    /// C++ 语义：ChildPointer.getHeight() = isLeaf() ? 0 : getNode()->mHeight
-    #[allow(dead_code)]
-    pub fn height_if_leaf(&self) -> Option<u8> {
-        match self {
-            ChildRef::Leaf(_) => Some(0),
-            ChildRef::Internal(_) => None,
-        }
     }
 }
 
@@ -356,10 +359,8 @@ impl BiNode {
         // right (bit=1) 放后面，sparse_key = 1
         node.sparse_partial_keys[0] = 0;
         node.sparse_partial_keys[1] = 1;
-        node.children = vec![
-            ChildRef::Internal(self.left.clone()),
-            ChildRef::Internal(self.right.clone()),
-        ];
+        // left/right 已经是 NodeId 类型
+        node.children = vec![self.left, self.right];
         node
     }
 }

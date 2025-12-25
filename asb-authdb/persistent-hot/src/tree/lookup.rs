@@ -1,7 +1,7 @@
 //! 查找操作
 
 use crate::hash::Hasher;
-use crate::node::{ChildRef, NodeId, SearchResult};
+use crate::node::{NodeId, SearchResult};
 use crate::store::{NodeStore, Result, StoreError};
 
 use super::core::HOTTree;
@@ -35,16 +35,17 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         match node.search(key) {
             SearchResult::Found { index } => {
-                match &node.children[index] {
-                    ChildRef::Internal(child_id) => {
+                let child = &node.children[index];
+                match child {
+                    NodeId::Internal(_) => {
                         // 递归搜索子节点
-                        self.lookup_internal(child_id, key)
+                        self.lookup_internal(child, key)
                     }
-                    ChildRef::Leaf(leaf_id) => {
+                    NodeId::Leaf(_) => {
                         // 获取叶子数据，验证 key 完全匹配
                         let leaf = self
                             .store
-                            .get_leaf(leaf_id)?
+                            .get_leaf(child)?
                             .ok_or(StoreError::NotFound)?;
                         if &leaf.key == key {
                             Ok(Some(leaf.value.clone()))

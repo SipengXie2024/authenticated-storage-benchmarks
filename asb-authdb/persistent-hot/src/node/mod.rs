@@ -16,7 +16,7 @@ mod tests;
 // Re-export 公开 API
 pub use self::core::PersistentHOTNode;
 pub use types::{
-    bincode_config, make_node_id, node_id_hash, node_id_version, BiNode, ChildRef,
-    InsertInformation, LeafData, NodeId, SearchResult, NODE_ID_SIZE,
+    bincode_config, make_raw_id, BiNode, InsertInformation, LeafData, NodeId, SearchResult,
+    NODE_ID_SIZE,
 };
 pub use utils::{extract_bit, find_first_differing_bit};

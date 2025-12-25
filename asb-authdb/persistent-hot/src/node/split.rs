@@ -1,7 +1,7 @@
 //! Split 操作（节点分裂与 Parent Pull Up）
 
 use super::core::PersistentHOTNode;
-use super::types::{BiNode, ChildRef};
+use super::types::{BiNode, NodeId};
 use crate::bits::{pdep32, pext32};
 
 impl PersistentHOTNode {
@@ -104,12 +104,12 @@ impl PersistentHOTNode {
             // Leaf 的 "height" = 0（C++ 语义），包装节点 height = 0 + 1 = 1
             // Internal 保守使用 self.height（无法访问 store 查询实际值）
             let height = match child {
-                ChildRef::Leaf(_) => 1,
-                ChildRef::Internal(_) => self.height,
+                NodeId::Leaf(_) => 1,
+                NodeId::Internal(_) => self.height,
             };
 
             let mut node = PersistentHOTNode::empty(height);
-            node.children.push(child.clone());
+            node.children.push(*child);
             return node;
         }
 
@@ -131,9 +131,7 @@ impl PersistentHOTNode {
         // 计算新节点 height（与 C++ 一致）
         // - 如果所有选中的 children 都是 Leaf，height = 1
         // - 否则保守使用 self.height（无法访问 store 查询 Internal 节点的实际 height）
-        let all_leaves = indices
-            .iter()
-            .all(|&idx| matches!(self.children[idx], ChildRef::Leaf(_)));
+        let all_leaves = indices.iter().all(|&idx| self.children[idx].is_leaf());
         let height = if all_leaves { 1 } else { self.height };
 
         // 构建新节点
@@ -149,7 +147,7 @@ impl PersistentHOTNode {
             let old_sparse = self.sparse_partial_keys[old_idx];
             let new_sparse = pext32(old_sparse, compression_mask);
             new_node.sparse_partial_keys[new_idx] = new_sparse;
-            new_node.children.push(self.children[old_idx].clone());
+            new_node.children.push(self.children[old_idx]);
         }
 
         new_node
@@ -237,7 +235,7 @@ impl PersistentHOTNode {
 
         // Step 4: 替换 old_child_index 为 left
         new_node.sparse_partial_keys[old_child_index] = left_sparse;
-        new_node.children[old_child_index] = ChildRef::Internal(bi_node.left.clone());
+        new_node.children[old_child_index] = bi_node.left;
 
         // Step 5: 找到 right 的插入位置（保持升序）
         let insert_pos = new_node.find_insert_position(right_sparse);
@@ -251,9 +249,7 @@ impl PersistentHOTNode {
         new_node.sparse_partial_keys[insert_pos] = right_sparse;
 
         // 6b. 插入 child（Vec::insert 自动处理）
-        new_node
-            .children
-            .insert(insert_pos, ChildRef::Internal(bi_node.right.clone()));
+        new_node.children.insert(insert_pos, bi_node.right);
 
         // 更新 height：bi_node.height 已经是"实体化节点高度"（= 子节点高度 + 1）
         // 父节点 height = max(原 height, bi_node.height)
@@ -427,7 +423,7 @@ impl PersistentHOTNode {
 
                 // 插入 left
                 new_node.sparse_partial_keys[new_idx] = left_sparse;
-                new_node.children.push(ChildRef::Internal(bi_node.left.clone()));
+                new_node.children.push(bi_node.left);
                 new_idx += 1;
 
                 // 找到 right 的插入位置（保持升序）
@@ -449,30 +445,26 @@ impl PersistentHOTNode {
                     // 检查是否应该在这个 entry 之前插入 right
                     if !right_inserted && right_sparse < remaining_reencoded {
                         new_node.sparse_partial_keys[new_idx] = right_sparse;
-                        new_node
-                            .children
-                            .push(ChildRef::Internal(bi_node.right.clone()));
+                        new_node.children.push(bi_node.right);
                         new_idx += 1;
                         right_inserted = true;
                     }
 
                     new_node.sparse_partial_keys[new_idx] = remaining_reencoded;
-                    new_node.children.push(self.children[remaining_idx].clone());
+                    new_node.children.push(self.children[remaining_idx]);
                     new_idx += 1;
                 }
 
                 // 如果 right 还没插入，放在最后
                 if !right_inserted {
                     new_node.sparse_partial_keys[new_idx] = right_sparse;
-                    new_node
-                        .children
-                        .push(ChildRef::Internal(bi_node.right.clone()));
+                    new_node.children.push(bi_node.right);
                 }
 
                 break; // 已处理完所有 entries
             } else {
                 new_node.sparse_partial_keys[new_idx] = reencoded_sparse;
-                new_node.children.push(self.children[old_idx].clone());
+                new_node.children.push(self.children[old_idx]);
                 new_idx += 1;
             }
         }

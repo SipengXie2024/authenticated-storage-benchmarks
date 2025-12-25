@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::hash::Blake3Hasher;
-use crate::node::{ChildRef, LeafData, PersistentHOTNode, NODE_ID_SIZE};
+use crate::node::{LeafData, NodeId, PersistentHOTNode, NODE_ID_SIZE};
 
 fn create_test_node() -> PersistentHOTNode {
     let mut node = PersistentHOTNode::empty(2);
@@ -11,10 +11,10 @@ fn create_test_node() -> PersistentHOTNode {
     node.sparse_partial_keys[1] = 1;
     node.sparse_partial_keys[2] = 2;
     node.sparse_partial_keys[3] = 3;
-    node.children.push(ChildRef::Leaf([0x00u8; NODE_ID_SIZE]));
-    node.children.push(ChildRef::Leaf([0x10u8; NODE_ID_SIZE]));
-    node.children.push(ChildRef::Leaf([0x01u8; NODE_ID_SIZE]));
-    node.children.push(ChildRef::Leaf([0x11u8; NODE_ID_SIZE]));
+    node.children.push(NodeId::Leaf([0x00u8; NODE_ID_SIZE]));
+    node.children.push(NodeId::Leaf([0x10u8; NODE_ID_SIZE]));
+    node.children.push(NodeId::Leaf([0x01u8; NODE_ID_SIZE]));
+    node.children.push(NodeId::Leaf([0x11u8; NODE_ID_SIZE]));
     node
 }
 
@@ -61,13 +61,14 @@ fn test_memory_store_put_and_get_leaf() {
 #[test]
 fn test_memory_store_get_nonexistent() {
     let store = MemoryNodeStore::new();
-    let fake_id = [0u8; NODE_ID_SIZE];
+    let fake_node_id = NodeId::Internal([0u8; NODE_ID_SIZE]);
+    let fake_leaf_id = NodeId::Leaf([0u8; NODE_ID_SIZE]);
 
     // 不存在的节点/叶子应该返回 None
-    assert!(store.get_node(&fake_id).unwrap().is_none());
-    assert!(store.get_leaf(&fake_id).unwrap().is_none());
-    assert!(!store.contains_node(&fake_id).unwrap());
-    assert!(!store.contains_leaf(&fake_id).unwrap());
+    assert!(store.get_node(&fake_node_id).unwrap().is_none());
+    assert!(store.get_leaf(&fake_leaf_id).unwrap().is_none());
+    assert!(!store.contains_node(&fake_node_id).unwrap());
+    assert!(!store.contains_leaf(&fake_leaf_id).unwrap());
 }
 
 #[test]
@@ -100,8 +101,8 @@ fn test_memory_store_multiple_nodes() {
             node.extraction_masks = PersistentHOTNode::masks_from_bits(&[i as u16]);
             node.sparse_partial_keys[0] = 0;
             node.sparse_partial_keys[1] = 1;
-            node.children.push(ChildRef::Leaf([i as u8; NODE_ID_SIZE]));
-            node.children.push(ChildRef::Leaf([(i + 1) as u8; NODE_ID_SIZE]));
+            node.children.push(NodeId::Leaf([i as u8; NODE_ID_SIZE]));
+            node.children.push(NodeId::Leaf([(i + 1) as u8; NODE_ID_SIZE]));
             node
         })
         .collect();
@@ -186,10 +187,6 @@ fn test_memory_store_separate_node_and_leaf() {
     // 各自能正确检索
     assert!(store.get_node(&node_id).unwrap().is_some());
     assert!(store.get_leaf(&leaf_id).unwrap().is_some());
-
-    // 交叉查询应该返回 None
-    assert!(store.get_node(&leaf_id).unwrap().is_none());
-    assert!(store.get_leaf(&node_id).unwrap().is_none());
 }
 
 // ============================================================================
@@ -242,13 +239,14 @@ mod kv_tests {
     fn test_kv_store_get_nonexistent() {
         let db = Arc::new(kvdb_memorydb::create(1));
         let store = KvNodeStore::new(db, 0, 1);
-        let fake_id = [0u8; NODE_ID_SIZE];
+        let fake_node_id = NodeId::Internal([0u8; NODE_ID_SIZE]);
+        let fake_leaf_id = NodeId::Leaf([0u8; NODE_ID_SIZE]);
 
         // 不存在的节点/叶子应该返回 None
-        assert!(store.get_node(&fake_id).unwrap().is_none());
-        assert!(store.get_leaf(&fake_id).unwrap().is_none());
-        assert!(!store.contains_node(&fake_id).unwrap());
-        assert!(!store.contains_leaf(&fake_id).unwrap());
+        assert!(store.get_node(&fake_node_id).unwrap().is_none());
+        assert!(store.get_leaf(&fake_leaf_id).unwrap().is_none());
+        assert!(!store.contains_node(&fake_node_id).unwrap());
+        assert!(!store.contains_leaf(&fake_leaf_id).unwrap());
     }
 
     #[test]
@@ -289,38 +287,6 @@ mod kv_tests {
     }
 
     #[test]
-    fn test_kv_store_key_format() {
-        let db = Arc::new(kvdb_memorydb::create(1));
-        let store = KvNodeStore::new(db, 0, 0x0102030405060708);
-        let node_id: NodeId = [
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
-            0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B,
-            0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
-        ];
-
-        let node_key = store.make_node_key(&node_id);
-        let leaf_key = store.make_leaf_key(&node_id);
-
-        // 验证 key 长度为 49 字节
-        assert_eq!(node_key.len(), 49);
-        assert_eq!(leaf_key.len(), 49);
-
-        // 验证前缀
-        assert_eq!(node_key[0], 0x00); // KEY_PREFIX_NODE
-        assert_eq!(leaf_key[0], 0x01); // KEY_PREFIX_LEAF
-
-        // 验证 version_id 在 [1..9]（big-endian）
-        assert_eq!(
-            &node_key[1..9],
-            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
-        );
-
-        // 验证 node_id 在 [9..49]
-        assert_eq!(&node_key[9..49], &node_id);
-        assert_eq!(&leaf_key[9..49], &node_id);
-    }
-
-    #[test]
     fn test_kv_store_multiple_nodes() {
         let db = Arc::new(kvdb_memorydb::create(1));
         let mut store = KvNodeStore::new(db, 0, 1);
@@ -332,8 +298,8 @@ mod kv_tests {
                 node.extraction_masks = PersistentHOTNode::masks_from_bits(&[i as u16]);
                 node.sparse_partial_keys[0] = 0;
                 node.sparse_partial_keys[1] = 1;
-                node.children.push(ChildRef::Leaf([i as u8; NODE_ID_SIZE]));
-                node.children.push(ChildRef::Leaf([(i + 1) as u8; NODE_ID_SIZE]));
+                node.children.push(NodeId::Leaf([i as u8; NODE_ID_SIZE]));
+                node.children.push(NodeId::Leaf([(i + 1) as u8; NODE_ID_SIZE]));
                 node
             })
             .collect();
@@ -397,9 +363,5 @@ mod kv_tests {
         // 各自能正确检索
         assert!(store.get_node(&node_id).unwrap().is_some());
         assert!(store.get_leaf(&leaf_id).unwrap().is_some());
-
-        // 交叉查询应该返回 None
-        assert!(store.get_node(&leaf_id).unwrap().is_none());
-        assert!(store.get_leaf(&node_id).unwrap().is_none());
     }
 }

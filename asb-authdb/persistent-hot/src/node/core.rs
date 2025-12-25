@@ -3,7 +3,7 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use super::types::{bincode_config, make_node_id, ChildRef, NodeId};
+use super::types::{bincode_config, NodeId};
 use super::utils::{extract_bit, find_first_differing_bit};
 use crate::hash::Hasher;
 
@@ -11,7 +11,7 @@ use crate::hash::Hasher;
 ///
 /// 混合布局策略（v4 设计）：
 /// - `sparse_partial_keys: [u32; 32]` — 固定大小，SIMD 友好
-/// - `children: Vec<ChildRef>` — 紧凑存储，节省空间
+/// - `children: Vec<NodeId>` — 紧凑存储，节省空间
 /// - `len()` 从 `children.len()` 推断，无需额外字段
 /// - 索引直接对应：`keys[i] ↔ children[i]`
 ///
@@ -33,7 +33,7 @@ pub struct PersistentHOTNode {
     /// 节点在树中的高度
     ///
     /// 定义：h(n) = max(h(children)) + 1
-    /// 叶子节点的 height = 1
+    /// 只含叶子的节点 height = 1（因为 Leaf height = 0）
     pub height: u8,
 
     /// Extraction masks，用于 PEXT 提取 dense partial key
@@ -55,7 +55,8 @@ pub struct PersistentHOTNode {
     ///
     /// `children.len()` = 有效 entries 数量。
     /// `children[i]` 对应 `sparse_partial_keys[i]`（直接索引）。
-    pub children: Vec<ChildRef>,
+    /// 可以是 `NodeId::Leaf` 或 `NodeId::Internal`。
+    pub children: Vec<NodeId>,
 }
 
 impl PersistentHOTNode {
@@ -96,14 +97,14 @@ impl PersistentHOTNode {
 
     /// 获取 child（直接索引）
     #[inline]
-    pub fn get_child(&self, index: usize) -> &ChildRef {
+    pub fn get_child(&self, index: usize) -> &NodeId {
         debug_assert!(index < self.len());
         &self.children[index]
     }
 
     /// 获取 child（可变引用）
     #[inline]
-    pub fn get_child_mut(&mut self, index: usize) -> &mut ChildRef {
+    pub fn get_child_mut(&mut self, index: usize) -> &mut NodeId {
         debug_assert!(index < self.len());
         &mut self.children[index]
     }
@@ -130,25 +131,29 @@ impl PersistentHOTNode {
 
     /// 创建单叶子节点
     ///
-    /// 需要传入已存储的叶子的 NodeId
+    /// 需要传入已存储的叶子的 NodeId（必须是 NodeId::Leaf）
     pub fn single_leaf(leaf_id: NodeId) -> Self {
+        debug_assert!(leaf_id.is_leaf(), "single_leaf requires NodeId::Leaf");
         Self {
-            height: 1,
+            height: 1, // max(leaf.height=0) + 1 = 1
             extraction_masks: [0; 4], // 无 discriminative bits
             sparse_partial_keys: [0; 32], // sparse key = 0
-            children: vec![ChildRef::Leaf(leaf_id)],
+            children: vec![leaf_id],
         }
     }
 
     /// 创建两叶子节点
     ///
-    /// 需要传入两个已存储的叶子的 NodeId 和它们的 key（用于计算 diff bit）
+    /// 需要传入两个已存储的叶子的 NodeId（必须是 NodeId::Leaf）和它们的 key（用于计算 diff bit）
     pub fn two_leaves(
         key1: &[u8; 32],
         leaf_id1: NodeId,
         key2: &[u8; 32],
         leaf_id2: NodeId,
     ) -> Self {
+        debug_assert!(leaf_id1.is_leaf(), "two_leaves requires NodeId::Leaf");
+        debug_assert!(leaf_id2.is_leaf(), "two_leaves requires NodeId::Leaf");
+
         let diff_bit = find_first_differing_bit(key1, key2).expect("keys must be different");
 
         let bit1 = extract_bit(key1, diff_bit);
@@ -165,10 +170,10 @@ impl PersistentHOTNode {
         sparse_partial_keys[1] = 1; // bit = 1
 
         Self {
-            height: 1, // 只包含叶子指针的节点 height = 1
+            height: 1, // max(leaf.height=0, leaf.height=0) + 1 = 1
             extraction_masks: Self::masks_from_bits(&[diff_bit]),
             sparse_partial_keys,
-            children: vec![ChildRef::Leaf(id_first), ChildRef::Leaf(id_second)],
+            children: vec![id_first, id_second],
         }
     }
 
@@ -218,11 +223,11 @@ impl PersistentHOTNode {
     // 序列化
     // ========================================================================
 
-    /// 计算节点的 NodeId（content-addressed）
+    /// 计算节点的 NodeId（content-addressed，返回 NodeId::Internal）
     pub fn compute_node_id<H: Hasher>(&self, version: u64) -> NodeId {
         let bytes = self.to_bytes().expect("Serialization should never fail");
         let hash = H::hash(&bytes);
-        make_node_id(version, &hash)
+        NodeId::internal(version, &hash)
     }
 
     /// 序列化为字节（用于存储）
