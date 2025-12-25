@@ -1,12 +1,61 @@
 //! 辅助函数
 
 use crate::hash::Hasher;
-use crate::node::{NodeId, PersistentHOTNode};
+use crate::node::{NodeId, PersistentHOTNode, SplitChild};
 use crate::store::{NodeStore, Result, StoreError};
 
 use super::core::{HOTTree, InsertStackEntry};
 
 impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
+    /// 获取 child 的高度（Leaf=0，Internal 读取存储）
+    pub(super) fn get_child_height(&self, child_id: &NodeId) -> Result<u8> {
+        if let Some(height) = child_id.height_if_leaf() {
+            return Ok(height);
+        }
+
+        let node = self
+            .store
+            .get_node(child_id)?
+            .ok_or(StoreError::NotFound)?;
+        Ok(node.height)
+    }
+
+    /// 将 split 子节点物化为 NodeId（必要时持久化新节点）
+    pub(super) fn materialize_split_child(
+        &mut self,
+        child: SplitChild,
+        version: u64,
+    ) -> Result<NodeId> {
+        match child {
+            SplitChild::Existing(id) => Ok(id),
+            SplitChild::Node(node) => {
+                let id = node.compute_node_id::<H>(version);
+                self.store.put_node(&id, &node)?;
+                Ok(id)
+            }
+        }
+    }
+
+    /// 将 split 子节点物化为 NodeId，并返回高度
+    pub(super) fn materialize_split_child_with_height(
+        &mut self,
+        child: SplitChild,
+        version: u64,
+    ) -> Result<(NodeId, u8)> {
+        match child {
+            SplitChild::Existing(id) => {
+                let height = self.get_child_height(&id)?;
+                Ok((id, height))
+            }
+            SplitChild::Node(node) => {
+                let id = node.compute_node_id::<H>(version);
+                let height = node.height;
+                self.store.put_node(&id, &node)?;
+                Ok((id, height))
+            }
+        }
+    }
+
     /// 向上传播指针更新
     ///
     /// 从栈中依次取出父节点，更新其 child 引用

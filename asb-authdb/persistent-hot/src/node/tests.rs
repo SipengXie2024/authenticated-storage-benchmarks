@@ -467,6 +467,15 @@ fn test_split_basic() {
 
     let (disc_bit, left, right) = node.split();
 
+    let left = match left {
+        SplitChild::Node(node) => node,
+        SplitChild::Existing(_) => panic!("left should be a node"),
+    };
+    let right = match right {
+        SplitChild::Node(node) => node,
+        SplitChild::Existing(_) => panic!("right should be a node"),
+    };
+
     // 验证分裂 bit
     assert_eq!(disc_bit, 3); // first_discriminative_bit
 
@@ -503,12 +512,19 @@ fn test_split_unbalanced() {
 
     let (disc_bit, left, right) = node.split();
 
+    let left = match left {
+        SplitChild::Node(node) => node,
+        SplitChild::Existing(_) => panic!("left should be a node"),
+    };
+    let right = match right {
+        SplitChild::Existing(id) => id,
+        SplitChild::Node(_) => panic!("right should be a single child"),
+    };
+
     assert_eq!(disc_bit, 3);
     assert_eq!(left.len(), 2);
-    assert_eq!(right.len(), 1);
-
-    // right 只有一个 entry，无 discriminative bits
-    assert_eq!(right.span(), 0);
+    // right 只有一个 entry
+    assert!(right.is_leaf());
 }
 
 #[test]

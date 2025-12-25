@@ -2,10 +2,10 @@
 
 use crate::hash::Hasher;
 use crate::node::{
-    extract_bit, find_first_differing_bit, BiNode, InsertInformation, NodeId,
-    PersistentHOTNode, SearchResult,
+    extract_bit, find_first_differing_bit, BiNode, InsertInformation, NodeId, PersistentHOTNode,
+    SearchResult, SplitChild,
 };
-use crate::store::{NodeStore, Result};
+use crate::store::{NodeStore, Result, StoreError};
 
 use super::core::{HOTTree, InsertStackEntry};
 
@@ -16,13 +16,37 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     pub(super) fn handle_overflow_normal_insert(
         &mut self,
         stack: &mut Vec<InsertStackEntry>,
-        _current_id: NodeId,
+        current_id: NodeId,
         node: &PersistentHOTNode,
         key: &[u8; 32],
         insert_info: &InsertInformation,
         leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
+        // Step 0: C++ 对齐 - 若新 discriminative bit 更靠前，则直接创建 BiNode
+        let first_bit = node
+            .first_discriminative_bit()
+            .expect("Cannot overflow insert into node with span=0");
+        if insert_info.discriminative_bit <= first_bit {
+            let existing_id = current_id;
+            let bi_node_height = node.height + 1;
+
+            let (left, right) = if insert_info.new_bit_value {
+                (existing_id, leaf_id)
+            } else {
+                (leaf_id, existing_id)
+            };
+
+            let mut bi_node = BiNode {
+                discriminative_bit: insert_info.discriminative_bit,
+                left,
+                right,
+                height: bi_node_height,
+            };
+
+            return self.integrate_binode_upwards(stack, &mut bi_node, version);
+        }
+
         // Step 1: Split 当前节点
         let (disc_bit, left_node, right_node) = node.split();
 
@@ -36,14 +60,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         };
 
         // Step 3: 持久化另一侧节点
-        let other_id = other_node.compute_node_id::<H>(version);
-        let other_height = other_node.height;
-        self.store.put_node(&other_id, &other_node)?;
+        let (other_id, other_height) =
+            self.materialize_split_child_with_height(other_node, version)?;
 
         // Step 4: 在目标节点添加新 entry
         // 使用 key 在目标子节点中重新计算 InsertInformation
-        let new_target_id = self.insert_into_split_child(
-            &target_node,
+        let new_target_id = self.insert_into_split_child_ref(
+            target_node,
             key,
             insert_info.discriminative_bit,
             insert_info.new_bit_value,
@@ -52,11 +75,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         )?;
 
         // 获取更新后的目标子节点高度
-        let new_target_node = self
-            .store
-            .get_node(&new_target_id)?
-            .expect("Just inserted node should exist");
-        let new_target_height = new_target_node.height;
+        let new_target_height = self.get_child_height(&new_target_id)?;
 
         // Step 5: 创建 BiNode
         let (final_left_id, final_right_id) = if goes_right {
@@ -80,6 +99,50 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     /// 在 split 后的子节点中添加 entry
     ///
     /// 使用 key 在子节点中搜索并确定插入逻辑。
+    pub(super) fn insert_into_split_child_ref(
+        &mut self,
+        split_child: SplitChild,
+        key: &[u8; 32],
+        orig_disc_bit: u16,
+        orig_new_bit_value: bool,
+        leaf_id: NodeId,
+        version: u64,
+    ) -> Result<NodeId> {
+        match split_child {
+            SplitChild::Node(node) => self.insert_into_split_child(
+                &node,
+                key,
+                orig_disc_bit,
+                orig_new_bit_value,
+                leaf_id,
+                version,
+            ),
+            SplitChild::Existing(child_id) => match child_id {
+                NodeId::Leaf(_) => {
+                    let existing_key = self.get_entry_key(&child_id)?;
+                    let new_node = PersistentHOTNode::two_leaves(&existing_key, child_id, key, leaf_id);
+                    let new_node_id = new_node.compute_node_id::<H>(version);
+                    self.store.put_node(&new_node_id, &new_node)?;
+                    Ok(new_node_id)
+                }
+                NodeId::Internal(_) => {
+                    let child_node = self
+                        .store
+                        .get_node(&child_id)?
+                        .ok_or(StoreError::NotFound)?;
+                    self.insert_into_split_child(
+                        &child_node,
+                        key,
+                        orig_disc_bit,
+                        orig_new_bit_value,
+                        leaf_id,
+                        version,
+                    )
+                }
+            },
+        }
+    }
+
     pub(super) fn insert_into_split_child(
         &mut self,
         node: &PersistentHOTNode,
@@ -108,20 +171,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     // 子节点也满了（罕见），递归处理
                     // 简化：直接 split 并创建中间节点
                     let (d, l, r) = node.split();
-                    let l_id = l.compute_node_id::<H>(version);
-                    let r_id = r.compute_node_id::<H>(version);
-                    self.store.put_node(&l_id, &l)?;
-                    self.store.put_node(&r_id, &r)?;
 
                     let goes_right = extract_bit(key, d);
-                    let (target, other_id) = if goes_right {
-                        (&r, l_id.clone())
-                    } else {
-                        (&l, r_id.clone())
-                    };
+                    let (target, other) = if goes_right { (r, l) } else { (l, r) };
+                    let other_id = self.materialize_split_child(other, version)?;
 
                     // 在目标子节点中递归
-                    let target_id = self.insert_into_split_child(
+                    let target_id = self.insert_into_split_child_ref(
                         target,
                         key,
                         orig_disc_bit,
@@ -161,19 +217,12 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 if node.len() >= 32 {
                     // 满了，需要 split
                     let (d, l, r) = node.split();
-                    let l_id = l.compute_node_id::<H>(version);
-                    let r_id = r.compute_node_id::<H>(version);
-                    self.store.put_node(&l_id, &l)?;
-                    self.store.put_node(&r_id, &r)?;
 
                     let goes_right = extract_bit(key, d);
-                    let (target, other_id) = if goes_right {
-                        (&r, l_id.clone())
-                    } else {
-                        (&l, r_id.clone())
-                    };
+                    let (target, other) = if goes_right { (r, l) } else { (l, r) };
+                    let other_id = self.materialize_split_child(other, version)?;
 
-                    let target_id = self.insert_into_split_child(
+                    let target_id = self.insert_into_split_child_ref(
                         target,
                         key,
                         orig_disc_bit,
@@ -240,16 +289,16 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 if parent.is_full() {
                     let (d, l, r) =
                         parent.split_with_binode(parent_entry.child_index, bi_node);
-                    let l_id = l.compute_node_id::<H>(version);
-                    let r_id = r.compute_node_id::<H>(version);
-                    self.store.put_node(&l_id, &l)?;
-                    self.store.put_node(&r_id, &r)?;
+                    let (l_id, l_height) =
+                        self.materialize_split_child_with_height(l, version)?;
+                    let (r_id, r_height) =
+                        self.materialize_split_child_with_height(r, version)?;
 
                     *bi_node = BiNode {
                         discriminative_bit: d,
                         left: l_id,
                         right: r_id,
-                        height: std::cmp::max(l.height, r.height) + 1,
+                        height: std::cmp::max(l_height, r_height) + 1,
                     };
                 } else {
                     let new_parent =
@@ -257,16 +306,16 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
                     if new_parent.is_full() {
                         let (d, l, r) = new_parent.split();
-                        let l_id = l.compute_node_id::<H>(version);
-                        let r_id = r.compute_node_id::<H>(version);
-                        self.store.put_node(&l_id, &l)?;
-                        self.store.put_node(&r_id, &r)?;
+                        let (l_id, l_height) =
+                            self.materialize_split_child_with_height(l, version)?;
+                        let (r_id, r_height) =
+                            self.materialize_split_child_with_height(r, version)?;
 
                         *bi_node = BiNode {
                             discriminative_bit: d,
                             left: l_id,
                             right: r_id,
-                            height: std::cmp::max(l.height, r.height) + 1,
+                            height: std::cmp::max(l_height, r_height) + 1,
                         };
                     } else {
                         let new_parent_id = new_parent.compute_node_id::<H>(version);
@@ -340,22 +389,17 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         };
 
         // Step 3: 持久化另一侧节点
-        let other_id = other_node.compute_node_id::<H>(version);
-        let other_height = other_node.height;
-        self.store.put_node(&other_id, &other_node)?;
+        let (other_id, other_height) =
+            self.materialize_split_child_with_height(other_node, version)?;
 
         // Step 4: 在目标节点完成插入
         // 注意：这是从 NotFound 分支来的，所以子节点搜索也会走 NotFound，
         // orig_disc_bit 和 orig_new_bit_value 不会被使用（传占位符值）
         let new_target_id =
-            self.insert_into_split_child(&target_node, key, 0, false, leaf_id, version)?;
+            self.insert_into_split_child_ref(target_node, key, 0, false, leaf_id, version)?;
 
         // 获取更新后的目标子节点高度
-        let new_target_node = self
-            .store
-            .get_node(&new_target_id)?
-            .expect("Just inserted node should exist");
-        let new_target_height = new_target_node.height;
+        let new_target_height = self.get_child_height(&new_target_id)?;
 
         // Step 5: 创建 BiNode
         let (final_left_id, final_right_id) = if new_bit_value {
@@ -386,13 +430,10 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     // 父节点已满：使用 split_with_binode 同时 split 并集成 BiNode
                     let (d, l, r) =
                         parent.split_with_binode(parent_entry.child_index, &bi_node);
-                    let l_id = l.compute_node_id::<H>(version);
-                    let r_id = r.compute_node_id::<H>(version);
-                    self.store.put_node(&l_id, &l)?;
-                    self.store.put_node(&r_id, &r)?;
-
-                    let l_height = l.height;
-                    let r_height = r.height;
+                    let (l_id, l_height) =
+                        self.materialize_split_child_with_height(l, version)?;
+                    let (r_id, r_height) =
+                        self.materialize_split_child_with_height(r, version)?;
                     bi_node = BiNode {
                         discriminative_bit: d,
                         left: l_id,
@@ -408,13 +449,10 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     if new_parent.is_full() {
                         // 集成后变满，继续 split 并递归
                         let (d, l, r) = new_parent.split();
-                        let l_id = l.compute_node_id::<H>(version);
-                        let r_id = r.compute_node_id::<H>(version);
-                        self.store.put_node(&l_id, &l)?;
-                        self.store.put_node(&r_id, &r)?;
-
-                        let l_height = l.height;
-                        let r_height = r.height;
+                        let (l_id, l_height) =
+                            self.materialize_split_child_with_height(l, version)?;
+                        let (r_id, r_height) =
+                            self.materialize_split_child_with_height(r, version)?;
                         bi_node = BiNode {
                             discriminative_bit: d,
                             left: l_id,

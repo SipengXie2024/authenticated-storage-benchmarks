@@ -15,6 +15,7 @@ mod tests;
 
 // Re-export 公开 API
 pub use self::core::PersistentHOTNode;
+pub use split::SplitChild;
 pub use types::{
     bincode_config, make_raw_id, BiNode, InsertInformation, LeafData, NodeId, SearchResult,
     NODE_ID_SIZE,

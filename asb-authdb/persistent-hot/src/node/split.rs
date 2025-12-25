@@ -4,6 +4,16 @@ use super::core::PersistentHOTNode;
 use super::types::{BiNode, NodeId};
 use crate::bits::{pdep32, pext32};
 
+/// Split 后的子节点表示
+///
+/// - `Existing`: 原有 child pointer（单 entry 分区）
+/// - `Node`: 新建压缩节点（多 entry 分区）
+#[derive(Debug, Clone)]
+pub enum SplitChild {
+    Existing(NodeId),
+    Node(PersistentHOTNode),
+}
+
 impl PersistentHOTNode {
     // ========================================================================
     // Split 操作
@@ -34,12 +44,15 @@ impl PersistentHOTNode {
     /// - left: root bit = 0 的 entries
     /// - right: root bit = 1 的 entries
     ///
-    /// 返回 (discriminative_bit, left_node, right_node)
+    /// 返回 (discriminative_bit, left_child, right_child)
+    ///
+    /// - 多 entry 分区：返回压缩后的新节点
+    /// - 单 entry 分区：直接返回原 child pointer
     ///
     /// # Panics
     ///
     /// 如果节点 span = 0（无法分裂）
-    pub fn split(&self) -> (u16, PersistentHOTNode, PersistentHOTNode) {
+    pub fn split(&self) -> (u16, SplitChild, SplitChild) {
         let disc_bit = self
             .first_discriminative_bit()
             .expect("Cannot split node with span=0");
@@ -72,45 +85,26 @@ impl PersistentHOTNode {
     ///
     /// 新节点的 height 计算遵循 C++ `compressEntries` 的语义：
     ///
-    /// - **单 entry Leaf**: `height = 1`（C++ 中 Leaf 的 getHeight()=0，节点=0+1=1）
-    /// - **单 entry Internal**: `height = self.height`（保守估计，因为无法访问 store）
-    /// - **多 entries 全 Leaf**: `height = 1`
-    /// - **多 entries 有 Internal**: `height = self.height`（保守估计）
-    ///
-    /// 这是 HOT 的设计选择：C++ 的 `compressEntries` 也直接继承 `sourceNode.mHeight`，
-    /// 不重新计算实际的子节点高度。这在 Parent Pull Up 场景中是正确的，因为
-    /// 被 pull up 的节点的高度不会增加。
+    /// - **单 entry**: 直接返回原 child pointer（不创建新节点）
+    /// - **多 entries**: 新节点继承 `self.height`（不重新计算子树实际高度）
     ///
     /// # Panics
     ///
     /// 在 debug 模式下，如果 `indices` 为空会 panic。
     /// Split 后两侧必须非空是 HOT 的不变量。
-    pub(super) fn compress_entries(&self, indices: &[usize], removed_bit: u16) -> PersistentHOTNode {
+    pub(super) fn compress_entries(&self, indices: &[usize], removed_bit: u16) -> SplitChild {
         debug_assert!(
             !indices.is_empty(),
             "HOT invariant violated: split should produce non-empty partitions"
         );
         if indices.is_empty() {
-            return PersistentHOTNode::empty(self.height);
+            return SplitChild::Node(PersistentHOTNode::empty(self.height));
         }
 
-        // 单个 entry：与 C++ 一致的 height 语义
-        // C++ compressEntries 单 entry 时直接返回原 ChildPointer（不创建新节点）
-        // C++ getHeight(): isLeaf() ? 0 : getNode()->mHeight
+        // 单个 entry：C++ compressEntries 直接返回原 ChildPointer
         if indices.len() == 1 {
             let idx = indices[0];
-            let child = &self.children[idx];
-
-            // Leaf 的 "height" = 0（C++ 语义），包装节点 height = 0 + 1 = 1
-            // Internal 保守使用 self.height（无法访问 store 查询实际值）
-            let height = match child {
-                NodeId::Leaf(_) => 1,
-                NodeId::Internal(_) => self.height,
-            };
-
-            let mut node = PersistentHOTNode::empty(height);
-            node.children.push(*child);
-            return node;
+            return SplitChild::Existing(self.children[idx]);
         }
 
         // 计算新的 extraction_masks（移除 removed_bit）
@@ -128,11 +122,8 @@ impl PersistentHOTNode {
         let all_bits = self.get_all_mask_bits();
         let compression_mask = all_bits & !root_sparse_mask;
 
-        // 计算新节点 height（与 C++ 一致）
-        // - 如果所有选中的 children 都是 Leaf，height = 1
-        // - 否则保守使用 self.height（无法访问 store 查询 Internal 节点的实际 height）
-        let all_leaves = indices.iter().all(|&idx| self.children[idx].is_leaf());
-        let height = if all_leaves { 1 } else { self.height };
+        // 计算新节点 height：继承 self.height（与 C++ 一致）
+        let height = self.height;
 
         // 构建新节点
         let mut new_node = PersistentHOTNode {
@@ -150,7 +141,7 @@ impl PersistentHOTNode {
             new_node.children.push(self.children[old_idx]);
         }
 
-        new_node
+        SplitChild::Node(new_node)
     }
 
     // ========================================================================
@@ -281,7 +272,7 @@ impl PersistentHOTNode {
         &self,
         child_index: usize,
         bi_node: &BiNode,
-    ) -> (u16, PersistentHOTNode, PersistentHOTNode) {
+    ) -> (u16, SplitChild, SplitChild) {
         debug_assert!(self.is_full(), "split_with_binode requires full node");
 
         let disc_bit = self
@@ -311,13 +302,13 @@ impl PersistentHOTNode {
             let left_node = self.compress_entries(&left_indices, disc_bit);
             let right_node =
                 self.compress_entries_with_binode(&right_indices, disc_bit, child_index, bi_node);
-            (left_node, right_node)
+            (left_node, SplitChild::Node(right_node))
         } else {
             // BiNode 在左侧
             let left_node =
                 self.compress_entries_with_binode(&left_indices, disc_bit, child_index, bi_node);
             let right_node = self.compress_entries(&right_indices, disc_bit);
-            (left_node, right_node)
+            (SplitChild::Node(left_node), right_node)
         };
 
         (disc_bit, left_node, right_node)
