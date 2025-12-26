@@ -1,7 +1,7 @@
 //! 辅助函数
 
 use crate::hash::Hasher;
-use crate::node::{NodeId, PersistentHOTNode, SplitChild};
+use crate::node::{extract_bit, find_first_differing_bit, NodeId, PersistentHOTNode, SearchResult, SplitChild};
 use crate::store::{NodeStore, Result, StoreError};
 
 use super::core::{HOTTree, InsertStackEntry};
@@ -126,6 +126,41 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 } else {
                     Err(StoreError::NotFound)
                 }
+            }
+        }
+    }
+
+    /// 为 split child 计算真实的 discriminative bit
+    ///
+    /// C++ 对齐：BiNode 必须使用真实的 diff bit，不能用占位符。
+    /// 对应 C++ BiNode::createFromExistingAndNewEntry 总是用真实 key 计算。
+    pub(super) fn compute_disc_bit_for_split_child(
+        &self,
+        split_child: &SplitChild,
+        key: &[u8; 32],
+    ) -> Result<(u16, bool)> {
+        match split_child {
+            SplitChild::Existing(id) => {
+                let existing_key = self.get_entry_key(id)?;
+                let diff = find_first_differing_bit(&existing_key, key)
+                    .expect("Keys must be different");
+                Ok((diff, extract_bit(key, diff)))
+            }
+            SplitChild::Node(node) => {
+                // 在节点中搜索并找到 affected entry
+                let affected_key = match node.search(key) {
+                    SearchResult::Found { index } => {
+                        self.get_entry_key(&node.children[index])?
+                    }
+                    SearchResult::NotFound { dense_key } => {
+                        let idx = self.find_affected_entry(node, dense_key)
+                            .expect("HOT invariant violated");
+                        self.get_entry_key(&node.children[idx])?
+                    }
+                };
+                let diff = find_first_differing_bit(&affected_key, key)
+                    .expect("Keys must be different");
+                Ok((diff, extract_bit(key, diff)))
             }
         }
     }

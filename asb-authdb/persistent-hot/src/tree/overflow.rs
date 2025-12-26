@@ -5,7 +5,7 @@ use crate::node::{
     extract_bit, find_first_differing_bit, BiNode, InsertInformation, NodeId, PersistentHOTNode,
     SearchResult, SplitChild,
 };
-use crate::store::{NodeStore, Result, StoreError};
+use crate::store::{NodeStore, Result};
 
 use super::core::{HOTTree, InsertStackEntry};
 
@@ -126,18 +126,26 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     Ok(new_node_id)
                 }
                 NodeId::Internal(_) => {
-                    let child_node = self
-                        .store
-                        .get_node(&child_id)?
-                        .ok_or(StoreError::NotFound)?;
-                    self.insert_into_split_child(
-                        &child_node,
-                        key,
-                        orig_disc_bit,
-                        orig_new_bit_value,
-                        leaf_id,
-                        version,
-                    )
+                    // C++ 对齐：创建 two-entry node 而非递归进入子节点
+                    // 对应 HOTSingleThreadedNode.hpp L533-536：
+                    // createTwoEntriesNode(BiNode::createFromExistingAndNewEntry(...))
+                    let child_height = self.get_child_height(&child_id)?;
+                    let (left, right) = if orig_new_bit_value {
+                        (child_id, leaf_id)
+                    } else {
+                        (leaf_id, child_id)
+                    };
+                    // leaf height = 0 (C++ 语义)，所以 max(child_height, 0) + 1 = child_height + 1
+                    let bi_node = BiNode {
+                        discriminative_bit: orig_disc_bit,
+                        left,
+                        right,
+                        height: child_height + 1,
+                    };
+                    let new_node = bi_node.to_two_entry_node();
+                    let new_node_id = new_node.compute_node_id::<H>(version);
+                    self.store.put_node(&new_node_id, &new_node)?;
+                    Ok(new_node_id)
                 }
             },
         }
@@ -187,6 +195,10 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     )?;
 
                     // 创建中间节点
+                    // C++ 对齐：height = max(left_height, right_height) + 1
+                    // 对应 BiNode.hpp L14: newHeight = existingNode.getHeight() + 1u
+                    let other_height = self.get_child_height(&other_id)?;
+                    let target_height = self.get_child_height(&target_id)?;
                     let (final_left, final_right) = if goes_right {
                         (other_id, target_id)
                     } else {
@@ -197,7 +209,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         discriminative_bit: d,
                         left: final_left.clone(),
                         right: final_right.clone(),
-                        height: node.height, // 保守估计
+                        height: std::cmp::max(other_height, target_height) + 1,
                     }
                     .to_two_entry_node();
 
@@ -231,6 +243,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         version,
                     )?;
 
+                    // C++ 对齐：height = max(left_height, right_height) + 1
+                    let other_height = self.get_child_height(&other_id)?;
+                    let target_height = self.get_child_height(&target_id)?;
                     let (final_left, final_right) = if goes_right {
                         (other_id, target_id)
                     } else {
@@ -241,7 +256,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         discriminative_bit: d,
                         left: final_left.clone(),
                         right: final_right.clone(),
-                        height: node.height,
+                        height: std::cmp::max(other_height, target_height) + 1,
                     }
                     .to_two_entry_node();
 
@@ -301,32 +316,19 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         height: std::cmp::max(l_height, r_height) + 1,
                     };
                 } else {
+                    // C++ 对齐：父节点未满时直接集成，即使变成 32 entries 也不继续 split
+                    // 只有下次插入时发现已满才需要 split
                     let new_parent =
                         parent.with_integrated_binode(parent_entry.child_index, bi_node);
 
-                    if new_parent.is_full() {
-                        let (d, l, r) = new_parent.split();
-                        let (l_id, l_height) =
-                            self.materialize_split_child_with_height(l, version)?;
-                        let (r_id, r_height) =
-                            self.materialize_split_child_with_height(r, version)?;
-
-                        *bi_node = BiNode {
-                            discriminative_bit: d,
-                            left: l_id,
-                            right: r_id,
-                            height: std::cmp::max(l_height, r_height) + 1,
-                        };
-                    } else {
-                        let new_parent_id = new_parent.compute_node_id::<H>(version);
-                        self.store.put_node(&new_parent_id, &new_parent)?;
-                        self.propagate_pointer_updates(
-                            std::mem::take(stack),
-                            new_parent_id.clone(),
-                            version,
-                        )?;
-                        return Ok(new_parent_id);
-                    }
+                    let new_parent_id = new_parent.compute_node_id::<H>(version);
+                    self.store.put_node(&new_parent_id, &new_parent)?;
+                    self.propagate_pointer_updates(
+                        std::mem::take(stack),
+                        new_parent_id.clone(),
+                        version,
+                    )?;
+                    return Ok(new_parent_id);
                 }
             } else {
                 // Intermediate Node Creation
@@ -393,10 +395,14 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             self.materialize_split_child_with_height(other_node, version)?;
 
         // Step 4: 在目标节点完成插入
-        // 注意：这是从 NotFound 分支来的，所以子节点搜索也会走 NotFound，
-        // orig_disc_bit 和 orig_new_bit_value 不会被使用（传占位符值）
+        // C++ 对齐：必须计算真实的 discriminative bit，不能用占位符
+        // 因为 insert_into_split_child_ref 可能会用到这些值来创建 BiNode
+        let (child_disc_bit, child_new_bit) = self.compute_disc_bit_for_split_child(
+            &target_node,
+            key,
+        )?;
         let new_target_id =
-            self.insert_into_split_child_ref(target_node, key, 0, false, leaf_id, version)?;
+            self.insert_into_split_child_ref(target_node, key, child_disc_bit, child_new_bit, leaf_id, version)?;
 
         // 获取更新后的目标子节点高度
         let new_target_height = self.get_child_height(&new_target_id)?;
@@ -442,37 +448,21 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     };
                     // 继续 while 循环处理上层
                 } else {
-                    // 父节点未满：直接集成 BiNode
+                    // C++ 对齐：父节点未满时直接集成，即使变成 32 entries 也不继续 split
+                    // 只有下次插入时发现已满才需要 split
                     let new_parent =
                         parent.with_integrated_binode(parent_entry.child_index, &bi_node);
 
-                    if new_parent.is_full() {
-                        // 集成后变满，继续 split 并递归
-                        let (d, l, r) = new_parent.split();
-                        let (l_id, l_height) =
-                            self.materialize_split_child_with_height(l, version)?;
-                        let (r_id, r_height) =
-                            self.materialize_split_child_with_height(r, version)?;
-                        bi_node = BiNode {
-                            discriminative_bit: d,
-                            left: l_id,
-                            right: r_id,
-                            height: std::cmp::max(l_height, r_height) + 1,
-                        };
-                        // 继续 while 循环处理上层
-                    } else {
-                        // 父节点未满，存储并结束
-                        let new_parent_id = new_parent.compute_node_id::<H>(version);
-                        self.store.put_node(&new_parent_id, &new_parent)?;
+                    let new_parent_id = new_parent.compute_node_id::<H>(version);
+                    self.store.put_node(&new_parent_id, &new_parent)?;
 
-                        // 向上传播指针更新（take stack 避免 clone 开销）
-                        self.propagate_pointer_updates(
-                            std::mem::take(stack),
-                            new_parent_id.clone(),
-                            version,
-                        )?;
-                        return Ok(new_parent_id);
-                    }
+                    // 向上传播指针更新（take stack 避免 clone 开销）
+                    self.propagate_pointer_updates(
+                        std::mem::take(stack),
+                        new_parent_id.clone(),
+                        version,
+                    )?;
+                    return Ok(new_parent_id);
                 }
             } else {
                 // ===== INTERMEDIATE NODE CREATION =====
