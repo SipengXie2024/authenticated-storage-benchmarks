@@ -1,10 +1,7 @@
 //! Overflow 处理（Split / Parent Pull Up / Intermediate Node Creation）
 
 use crate::hash::Hasher;
-use crate::node::{
-    extract_bit, find_first_differing_bit, BiNode, InsertInformation, NodeId, PersistentHOTNode,
-    SearchResult, SplitChild,
-};
+use crate::node::{BiNode, InsertInformation, NodeId, PersistentHOTNode};
 use crate::store::{NodeStore, Result};
 
 use super::core::{HOTTree, InsertStackEntry};
@@ -12,13 +9,13 @@ use super::core::{HOTTree, InsertStackEntry};
 impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     /// 处理 Normal Insert 时的节点溢出
     ///
-    /// Split 当前节点，在目标子节点中重新计算 InsertInformation 并添加 entry。
+    /// 使用 C++ 风格的 split_with_insert 同时完成 split 和 insert。
     pub(super) fn handle_overflow_normal_insert(
         &mut self,
         stack: &mut Vec<InsertStackEntry>,
         current_id: NodeId,
         node: &PersistentHOTNode,
-        key: &[u8; 32],
+        _key: &[u8; 32],
         insert_info: &InsertInformation,
         leaf_id: NodeId,
         version: u64,
@@ -47,246 +44,33 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             return self.integrate_binode_upwards(stack, &mut bi_node, version);
         }
 
-        // Step 1: Split 当前节点
-        let (disc_bit, left_node, right_node) = node.split();
-
-        // Step 2: 使用 key 的 disc_bit 确定新 entry 插入哪侧
-        let goes_right = extract_bit(key, disc_bit);
-
-        let (target_node, other_node) = if goes_right {
-            (right_node, left_node)
-        } else {
-            (left_node, right_node)
-        };
-
-        // Step 3: 持久化另一侧节点
-        let (other_id, other_height) =
-            self.materialize_split_child_with_height(other_node, version)?;
-
-        // Step 4: 在目标节点添加新 entry
-        // 使用 key 在目标子节点中重新计算 InsertInformation
-        let new_target_id = self.insert_into_split_child_ref(
-            target_node,
-            key,
+        // Step 1: 使用 split_with_insert 同时完成 split 和 insert（C++ 风格）
+        let (disc_bit, left_child, right_child) = node.split_with_insert(
             insert_info.discriminative_bit,
             insert_info.new_bit_value,
+            insert_info.first_index_in_affected_subtree,
+            insert_info.number_entries_in_affected_subtree,
+            insert_info.subtree_prefix_partial_key,
             leaf_id,
-            version,
-        )?;
+        );
 
-        // 获取更新后的目标子节点高度
-        let new_target_height = self.get_child_height(&new_target_id)?;
+        // Step 2: 持久化两侧节点
+        let (left_id, left_height) =
+            self.materialize_split_child_with_height(left_child, version)?;
+        let (right_id, right_height) =
+            self.materialize_split_child_with_height(right_child, version)?;
 
-        // Step 5: 创建 BiNode
-        let (final_left_id, final_right_id) = if goes_right {
-            (other_id.clone(), new_target_id)
-        } else {
-            (new_target_id, other_id.clone())
-        };
-
-        let max_child_height = std::cmp::max(new_target_height, other_height);
+        // Step 3: 创建 BiNode
+        let max_child_height = std::cmp::max(left_height, right_height);
         let mut bi_node = BiNode {
             discriminative_bit: disc_bit,
-            left: final_left_id,
-            right: final_right_id,
+            left: left_id,
+            right: right_id,
             height: max_child_height + 1,
         };
 
-        // Step 6: 向上处理（复用现有逻辑）
+        // Step 4: 向上处理（复用现有逻辑）
         self.integrate_binode_upwards(stack, &mut bi_node, version)
-    }
-
-    /// 在 split 后的子节点中添加 entry
-    ///
-    /// 使用 key 在子节点中搜索并确定插入逻辑。
-    pub(super) fn insert_into_split_child_ref(
-        &mut self,
-        split_child: SplitChild,
-        key: &[u8; 32],
-        orig_disc_bit: u16,
-        orig_new_bit_value: bool,
-        leaf_id: NodeId,
-        version: u64,
-    ) -> Result<NodeId> {
-        match split_child {
-            SplitChild::Node(node) => self.insert_into_split_child(
-                &node,
-                key,
-                orig_disc_bit,
-                orig_new_bit_value,
-                leaf_id,
-                version,
-            ),
-            SplitChild::Existing(child_id) => match child_id {
-                NodeId::Leaf(_) => {
-                    let existing_key = self.get_entry_key(&child_id)?;
-                    let new_node = PersistentHOTNode::two_leaves(&existing_key, child_id, key, leaf_id);
-                    let new_node_id = new_node.compute_node_id::<H>(version);
-                    self.store.put_node(&new_node_id, &new_node)?;
-                    Ok(new_node_id)
-                }
-                NodeId::Internal(_) => {
-                    // C++ 对齐：创建 two-entry node 而非递归进入子节点
-                    // 对应 HOTSingleThreadedNode.hpp L533-536：
-                    // createTwoEntriesNode(BiNode::createFromExistingAndNewEntry(...))
-                    let child_height = self.get_child_height(&child_id)?;
-                    let (left, right) = if orig_new_bit_value {
-                        (child_id, leaf_id)
-                    } else {
-                        (leaf_id, child_id)
-                    };
-                    // leaf height = 0 (C++ 语义)，所以 max(child_height, 0) + 1 = child_height + 1
-                    let bi_node = BiNode {
-                        discriminative_bit: orig_disc_bit,
-                        left,
-                        right,
-                        height: child_height + 1,
-                    };
-                    let new_node = bi_node.to_two_entry_node();
-                    let new_node_id = new_node.compute_node_id::<H>(version);
-                    self.store.put_node(&new_node_id, &new_node)?;
-                    Ok(new_node_id)
-                }
-            },
-        }
-    }
-
-    pub(super) fn insert_into_split_child(
-        &mut self,
-        node: &PersistentHOTNode,
-        key: &[u8; 32],
-        orig_disc_bit: u16,
-        orig_new_bit_value: bool,
-        leaf_id: NodeId,
-        version: u64,
-    ) -> Result<NodeId> {
-        // 如果子节点为空，直接创建单叶子节点
-        if node.len() == 0 {
-            let new_node = PersistentHOTNode::single_leaf(leaf_id);
-            let new_node_id = new_node.compute_node_id::<H>(version);
-            self.store.put_node(&new_node_id, &new_node)?;
-            return Ok(new_node_id);
-        }
-
-        // 在子节点中搜索
-        match node.search(key) {
-            SearchResult::Found { index } => {
-                // 在子节点中重新计算 InsertInformation
-                let new_info =
-                    node.get_insert_information(index, orig_disc_bit, orig_new_bit_value);
-
-                if node.len() >= 32 {
-                    // 子节点也满了（罕见），递归处理
-                    // 简化：直接 split 并创建中间节点
-                    let (d, l, r) = node.split();
-
-                    let goes_right = extract_bit(key, d);
-                    let (target, other) = if goes_right { (r, l) } else { (l, r) };
-                    let other_id = self.materialize_split_child(other, version)?;
-
-                    // 在目标子节点中递归
-                    let target_id = self.insert_into_split_child_ref(
-                        target,
-                        key,
-                        orig_disc_bit,
-                        orig_new_bit_value,
-                        leaf_id,
-                        version,
-                    )?;
-
-                    // 创建中间节点
-                    // C++ 对齐：height = max(left_height, right_height) + 1
-                    // 对应 BiNode.hpp L14: newHeight = existingNode.getHeight() + 1u
-                    let other_height = self.get_child_height(&other_id)?;
-                    let target_height = self.get_child_height(&target_id)?;
-                    let (final_left, final_right) = if goes_right {
-                        (other_id, target_id)
-                    } else {
-                        (target_id, other_id)
-                    };
-
-                    let intermediate = BiNode {
-                        discriminative_bit: d,
-                        left: final_left.clone(),
-                        right: final_right.clone(),
-                        height: std::cmp::max(other_height, target_height) + 1,
-                    }
-                    .to_two_entry_node();
-
-                    let intermediate_id = intermediate.compute_node_id::<H>(version);
-                    self.store.put_node(&intermediate_id, &intermediate)?;
-                    return Ok(intermediate_id);
-                }
-
-                // 使用 with_new_entry_from_info 添加 entry
-                let new_node = node.with_new_entry_from_info(&new_info, leaf_id);
-                let new_node_id = new_node.compute_node_id::<H>(version);
-                self.store.put_node(&new_node_id, &new_node)?;
-                Ok(new_node_id)
-            }
-            SearchResult::NotFound { dense_key } => {
-                // 没有直接匹配：找到 affected entry 并添加
-                if node.len() >= 32 {
-                    // 满了，需要 split
-                    let (d, l, r) = node.split();
-
-                    let goes_right = extract_bit(key, d);
-                    let (target, other) = if goes_right { (r, l) } else { (l, r) };
-                    let other_id = self.materialize_split_child(other, version)?;
-
-                    let target_id = self.insert_into_split_child_ref(
-                        target,
-                        key,
-                        orig_disc_bit,
-                        orig_new_bit_value,
-                        leaf_id,
-                        version,
-                    )?;
-
-                    // C++ 对齐：height = max(left_height, right_height) + 1
-                    let other_height = self.get_child_height(&other_id)?;
-                    let target_height = self.get_child_height(&target_id)?;
-                    let (final_left, final_right) = if goes_right {
-                        (other_id, target_id)
-                    } else {
-                        (target_id, other_id)
-                    };
-
-                    let intermediate = BiNode {
-                        discriminative_bit: d,
-                        left: final_left.clone(),
-                        right: final_right.clone(),
-                        height: std::cmp::max(other_height, target_height) + 1,
-                    }
-                    .to_two_entry_node();
-
-                    let intermediate_id = intermediate.compute_node_id::<H>(version);
-                    self.store.put_node(&intermediate_id, &intermediate)?;
-                    return Ok(intermediate_id);
-                }
-
-                // 找到 affected entry 并计算 diff bit
-                let affected_index = self
-                    .find_affected_entry(node, dense_key)
-                    .expect("HOT invariant violated: no matching entry found");
-                let affected_child = &node.children[affected_index];
-                let affected_key = self.get_entry_key(affected_child)?;
-
-                let diff_bit = find_first_differing_bit(&affected_key, key)
-                    .expect("Keys must be different");
-                let new_bit_value = extract_bit(key, diff_bit);
-
-                let new_node = node.with_new_entry(
-                    diff_bit,
-                    new_bit_value,
-                    affected_index,
-                    leaf_id,
-                );
-                let new_node_id = new_node.compute_node_id::<H>(version);
-                self.store.put_node(&new_node_id, &new_node)?;
-                Ok(new_node_id)
-            }
-        }
     }
 
     /// 将 BiNode 向上集成到父节点（提取自 handle_overflow_with_stack）
@@ -361,10 +145,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
     /// 处理节点溢出（带栈支持的完整 Parent Pull Up / Intermediate Node Creation）
     ///
+    /// 使用 C++ 风格的 split_with_insert 同时完成 split 和 insert。
+    ///
     /// # 逻辑
     ///
-    /// 1. Split 当前节点
-    /// 2. 在目标子节点完成叶子插入
+    /// 0. 若 disc_bit <= first_discriminative_bit，直接创建 BiNode（不 split）
+    /// 1. 使用 split_with_insert 同时 split 并 insert
+    /// 2. 持久化两侧节点
     /// 3. 创建 BiNode
     /// 4. 检查父节点高度决定策略：
     ///    - `bi_node.height == parent.height` → Parent Pull Up
@@ -373,54 +160,64 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     pub(super) fn handle_overflow_with_stack(
         &mut self,
         stack: &mut Vec<InsertStackEntry>,
-        _current_id: NodeId,
+        current_id: NodeId,
         node: &PersistentHOTNode,
-        key: &[u8; 32],
+        disc_bit: u16,
+        new_bit_value: bool,
+        first_affected_index: usize,
+        num_affected_entries: usize,
+        subtree_prefix: u32,
         leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
-        // Step 1: Split 当前节点
-        let (disc_bit, left_node, right_node) = node.split();
+        // Step 0: C++ 对齐 - 若新 discriminative bit 更靠前，则直接创建 BiNode
+        // 与 handle_overflow_normal_insert 一致
+        let first_bit = node
+            .first_discriminative_bit()
+            .expect("Cannot overflow insert into node with span=0");
+        if disc_bit <= first_bit {
+            let existing_id = current_id;
+            let bi_node_height = node.height + 1;
 
-        // Step 2: 确定新 entry 插入哪侧
-        let new_bit_value = extract_bit(key, disc_bit);
-        let (target_node, other_node) = if new_bit_value {
-            (right_node, left_node)
-        } else {
-            (left_node, right_node)
-        };
+            let (left, right) = if new_bit_value {
+                (existing_id, leaf_id)
+            } else {
+                (leaf_id, existing_id)
+            };
 
-        // Step 3: 持久化另一侧节点
-        let (other_id, other_height) =
-            self.materialize_split_child_with_height(other_node, version)?;
+            let mut bi_node = BiNode {
+                discriminative_bit: disc_bit,
+                left,
+                right,
+                height: bi_node_height,
+            };
 
-        // Step 4: 在目标节点完成插入
-        // C++ 对齐：必须计算真实的 discriminative bit，不能用占位符
-        // 因为 insert_into_split_child_ref 可能会用到这些值来创建 BiNode
-        let (child_disc_bit, child_new_bit) = self.compute_disc_bit_for_split_child(
-            &target_node,
-            key,
-        )?;
-        let new_target_id =
-            self.insert_into_split_child_ref(target_node, key, child_disc_bit, child_new_bit, leaf_id, version)?;
+            return self.integrate_binode_upwards(stack, &mut bi_node, version);
+        }
 
-        // 获取更新后的目标子节点高度
-        let new_target_height = self.get_child_height(&new_target_id)?;
+        // Step 1: 使用 split_with_insert 同时完成 split 和 insert（C++ 风格）
+        let (split_bit, left_child, right_child) = node.split_with_insert(
+            disc_bit,
+            new_bit_value,
+            first_affected_index,
+            num_affected_entries,
+            subtree_prefix,
+            leaf_id,
+        );
 
-        // Step 5: 创建 BiNode
-        let (final_left_id, final_right_id) = if new_bit_value {
-            (other_id.clone(), new_target_id)
-        } else {
-            (new_target_id, other_id.clone())
-        };
+        // Step 2: 持久化两侧节点
+        let (left_id, left_height) =
+            self.materialize_split_child_with_height(left_child, version)?;
+        let (right_id, right_height) =
+            self.materialize_split_child_with_height(right_child, version)?;
 
-        let max_child_height = std::cmp::max(new_target_height, other_height);
+        // Step 3: 创建 BiNode
+        let max_child_height = std::cmp::max(left_height, right_height);
         // BiNode.height = 子节点最大高度 + 1（与 C++ HOTSingleThreadedNode.hpp L560 一致）
-        // 这表示"如果将 BiNode 实体化为节点，该节点的高度"
         let mut bi_node = BiNode {
-            discriminative_bit: disc_bit,
-            left: final_left_id,
-            right: final_right_id,
+            discriminative_bit: split_bit,
+            left: left_id,
+            right: right_id,
             height: max_child_height + 1,
         };
 

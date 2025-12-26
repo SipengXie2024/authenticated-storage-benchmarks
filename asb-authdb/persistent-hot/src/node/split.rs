@@ -77,6 +77,273 @@ impl PersistentHOTNode {
         (disc_bit, left_node, right_node)
     }
 
+    /// C++ 风格：Split + Insert 一步完成
+    ///
+    /// 对应 C++ `HOTSingleThreadedNode::split(InsertInformation, newValue)`：
+    /// 分裂节点的同时，将新 entry 添加到目标侧。
+    ///
+    /// # 参数
+    ///
+    /// - `new_disc_bit`: 新 entry 与现有 entry 的 discriminative bit
+    /// - `new_bit_value`: 新 entry 在该 bit 的值（决定去 left 还是 right）
+    /// - `first_affected_index`: affected subtree 的第一个 entry 索引
+    /// - `num_affected_entries`: affected subtree 中的 entries 数量
+    /// - `subtree_prefix`: affected subtree 共享的 prefix（用于生成新 entry 的 sparse key）
+    /// - `new_child`: 新 entry 的 NodeId
+    ///
+    /// # 返回
+    ///
+    /// `(split_bit, left_child, right_child)` - 分裂后的两个节点
+    ///
+    /// # C++ 对应
+    ///
+    /// ```cpp
+    /// return (insertInformation.mFirstIndexInAffectedSubtree >= numberSmallerEntries)
+    ///     ? BiNode { disc_bit, compressEntries(...), compressEntriesAndAddOneEntryIntoNewNode(...) }
+    ///     : BiNode { disc_bit, compressEntriesAndAddOneEntryIntoNewNode(...), compressEntries(...) };
+    /// ```
+    pub fn split_with_insert(
+        &self,
+        new_disc_bit: u16,
+        new_bit_value: bool,
+        first_affected_index: usize,
+        num_affected_entries: usize,
+        subtree_prefix: u32,
+        new_child: NodeId,
+    ) -> (u16, SplitChild, SplitChild) {
+        let split_bit = self
+            .first_discriminative_bit()
+            .expect("Cannot split node with span=0");
+        let root_mask = self.get_root_mask();
+
+        // 收集两组 entries
+        let mut left_indices = Vec::new();
+        let mut right_indices = Vec::new();
+
+        for i in 0..self.len() {
+            if (self.sparse_partial_keys[i] & root_mask) == 0 {
+                left_indices.push(i);
+            } else {
+                right_indices.push(i);
+            }
+        }
+
+        // 确定新 entry 去哪侧（基于 first_affected_index 所在的分区）
+        // C++ 用 mFirstIndexInAffectedSubtree >= numberSmallerEntries 判断
+        let affected_sparse = self.sparse_partial_keys[first_affected_index];
+        let goes_right = (affected_sparse & root_mask) != 0;
+
+        // 创建子节点：目标侧压缩+添加，另一侧只压缩
+        if goes_right {
+            let left_node = self.compress_entries(&left_indices, split_bit);
+            let right_node = self.compress_entries_and_add(
+                &right_indices,
+                split_bit,
+                new_disc_bit,
+                new_bit_value,
+                first_affected_index,
+                num_affected_entries,
+                subtree_prefix,
+                new_child,
+            );
+            (split_bit, left_node, right_node)
+        } else {
+            let left_node = self.compress_entries_and_add(
+                &left_indices,
+                split_bit,
+                new_disc_bit,
+                new_bit_value,
+                first_affected_index,
+                num_affected_entries,
+                subtree_prefix,
+                new_child,
+            );
+            let right_node = self.compress_entries(&right_indices, split_bit);
+            (split_bit, left_node, right_node)
+        }
+    }
+
+    /// 压缩 entries 并添加新 entry（C++ compressEntriesAndAddOneEntryIntoNewNode）
+    ///
+    /// 对齐 C++ HOTSingleThreadedNode.hpp L185-248：
+    /// - 对 affected subtree 中的**所有** entries 设置新 bit
+    /// - 新 entry 插入在 affected subtree 的边界
+    ///
+    /// # 参数
+    ///
+    /// - `indices`: 分区内的 entry 索引
+    /// - `_removed_bit`: 被移除的分区 bit（用于压缩）
+    /// - `new_disc_bit`: 新 entry 的 discriminative bit
+    /// - `new_bit_value`: 新 entry 在该 bit 的值
+    /// - `first_affected_index`: affected subtree 的第一个 entry 索引（在原节点中）
+    /// - `num_affected_entries`: affected subtree 中的 entries 数量
+    /// - `subtree_prefix`: affected subtree 共享的 prefix（C++ mSubtreePrefixPartialKey）
+    /// - `new_child`: 新 entry
+    #[allow(clippy::too_many_arguments)]
+    fn compress_entries_and_add(
+        &self,
+        indices: &[usize],
+        _removed_bit: u16,
+        new_disc_bit: u16,
+        new_bit_value: bool,
+        first_affected_index: usize,
+        num_affected_entries: usize,
+        subtree_prefix: u32,
+        new_child: NodeId,
+    ) -> SplitChild {
+        debug_assert!(!indices.is_empty());
+
+        // 单个 entry 且是 affected：直接创建 two-entry node
+        // 对应 C++ compressEntriesAndAddOneEntryIntoNewNode 的 else 分支
+        if indices.len() == 1 {
+            let existing_child = self.children[indices[0]];
+            let (left, right) = if new_bit_value {
+                (existing_child, new_child)
+            } else {
+                (new_child, existing_child)
+            };
+            // 创建 two-entry node
+            let mut node = PersistentHOTNode::empty(self.height);
+            node.extraction_masks = PersistentHOTNode::masks_from_bits(&[new_disc_bit]);
+            node.sparse_partial_keys[0] = 0; // left: bit = 0
+            node.sparse_partial_keys[1] = 1; // right: bit = 1
+            node.children = vec![left, right];
+            return SplitChild::Node(node);
+        }
+
+        // 多个 entries：压缩并添加新 entry
+        // 对应 C++ compressEntriesAndAddOneEntryIntoNewNode 的 if 分支
+
+        // Step 1: 计算分区内的 relevant bits
+        let relevant_bits = self.get_relevant_bits_for_indices(indices);
+
+        // Step 2: 重建 extraction_masks 并添加新 bit
+        let mut new_masks = self.rebuild_extraction_masks_from_relevant_bits(relevant_bits);
+
+        // 添加 new_disc_bit
+        let new_chunk = (new_disc_bit / 64) as usize;
+        let new_bit_in_chunk = new_disc_bit % 64;
+        let new_u64_bit_pos = 63 - new_bit_in_chunk;
+        let bit_to_add = 1u64 << new_u64_bit_pos;
+        let is_new_bit = (new_masks[new_chunk] & bit_to_add) == 0;
+        if is_new_bit {
+            new_masks[new_chunk] |= bit_to_add;
+        }
+
+        // Step 3: 构建新节点
+        let mut new_node = PersistentHOTNode {
+            height: self.height,
+            extraction_masks: new_masks,
+            sparse_partial_keys: [0; 32],
+            children: Vec::with_capacity(indices.len() + 1),
+        };
+
+        // 获取新 bit 在 sparse key 中的 mask
+        let new_bit_mask = new_node.get_mask_for_bit(new_disc_bit);
+
+        // 计算 PDEP deposit mask（如果添加了新 bit）
+        let deposit_mask = if is_new_bit {
+            let compressed_span = relevant_bits.count_ones();
+            let low_mask = new_bit_mask - 1;
+            let high_mask = if compressed_span > 0 {
+                ((1u32 << compressed_span) - 1) & !low_mask
+            } else {
+                0
+            };
+            (high_mask << 1) | low_mask
+        } else {
+            u32::MAX
+        };
+
+        // Step 4: 计算分区内 affected subtree 的边界
+        // C++ L203: numberEntriesBeforeAffectedSubtree = firstIndexInAffectedSubtree - firstIndexInRange
+        let first_affected_pos = indices
+            .iter()
+            .position(|&i| i == first_affected_index)
+            .expect("first_affected_index must be in indices");
+
+        // 在分区内，affected subtree 可能只包含部分 entries
+        // 需要找出 indices 中有多少 entries 属于 affected subtree
+        let last_affected_index = first_affected_index + num_affected_entries;
+        let num_affected_in_partition = indices
+            .iter()
+            .filter(|&&i| i >= first_affected_index && i < last_affected_index)
+            .count();
+
+        // C++ L217: newBitForExistingEntries = (1 - keyInformation.mValue)
+        // 如果 new_bit_value = true，旧 entries 的新 bit = 0
+        // 如果 new_bit_value = false，旧 entries 的新 bit = 1
+        let additional_mask_for_existing = if new_bit_value { 0 } else { new_bit_mask };
+
+        // Step 5: 计算新 entry 的 sparse key
+        // C++ L200: 使用 mSubtreePrefixPartialKey（affected subtree 共享的 prefix），而不是单个 entry 的 sparse key
+        // 这确保新 entry 的 sparse key 不会包含 affected subtree 内部的区分位
+        let prefix_compressed = pext32(subtree_prefix, relevant_bits);
+        let prefix_reencoded = if is_new_bit {
+            pdep32(prefix_compressed, deposit_mask)
+        } else {
+            prefix_compressed
+        };
+        let new_entry_sparse = if new_bit_value {
+            prefix_reencoded | new_bit_mask  // bit = 1
+        } else {
+            prefix_reencoded  // bit = 0
+        };
+
+        // Step 6: 压缩 entries，按 C++ 三段式处理
+        // C++ L240: targetIndexForNewValue = numberEntriesBeforeAffectedSubtree + (mValue * numAffected)
+        // 如果 new_bit_value = true，新 entry 在 affected subtree 之后
+        // 如果 new_bit_value = false，新 entry 在 affected subtree 之前
+        let new_entry_pos = if new_bit_value {
+            first_affected_pos + num_affected_in_partition
+        } else {
+            first_affected_pos
+        };
+
+        let mut new_idx = 0;
+        let mut new_entry_inserted = false;
+
+        for (pos, &old_idx) in indices.iter().enumerate() {
+            // 在 new_entry_pos 位置插入新 entry
+            if pos == new_entry_pos && !new_entry_inserted {
+                new_node.sparse_partial_keys[new_idx] = new_entry_sparse;
+                new_node.children.push(new_child);
+                new_idx += 1;
+                new_entry_inserted = true;
+            }
+
+            // 处理当前 entry
+            let old_sparse = self.sparse_partial_keys[old_idx];
+            let compressed = pext32(old_sparse, relevant_bits);
+            let reencoded = if is_new_bit {
+                pdep32(compressed, deposit_mask)
+            } else {
+                compressed
+            };
+
+            // 检查当前 entry 是否在 affected subtree 中
+            let is_in_affected = old_idx >= first_affected_index && old_idx < last_affected_index;
+            let final_sparse = if is_in_affected {
+                // C++ L225: 对 affected subtree 中的 entries 设置新 bit
+                reencoded | additional_mask_for_existing
+            } else {
+                reencoded
+            };
+
+            new_node.sparse_partial_keys[new_idx] = final_sparse;
+            new_node.children.push(self.children[old_idx]);
+            new_idx += 1;
+        }
+
+        // 如果新 entry 应该在最后，且还没插入
+        if !new_entry_inserted {
+            new_node.sparse_partial_keys[new_idx] = new_entry_sparse;
+            new_node.children.push(new_child);
+        }
+
+        SplitChild::Node(new_node)
+    }
+
     /// 压缩指定 entries 到新节点
     ///
     /// 按照 C++ `compressEntries` 的语义，重新计算分区内真正需要的 discriminative bits。

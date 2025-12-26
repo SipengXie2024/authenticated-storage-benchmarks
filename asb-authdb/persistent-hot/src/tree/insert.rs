@@ -347,32 +347,34 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         leaf_id: NodeId,
         version: u64,
     ) -> Result<NodeId> {
-        // 检查节点是否已满
-        if node.len() >= 32 {
-            // 节点溢出：需要 Split + Parent Pull Up / Intermediate Node Creation
-            return self.handle_overflow_with_stack(
-                stack,
-                current_id,
-                &node,
-                key,
-                leaf_id,
-                version,
-            );
-        }
-
-        // 找到 affected entry
+        // 先计算 affected_index 和 disc_bit（无论是否 overflow 都需要）
         let affected_index = self
             .find_affected_entry(&node, dense_key)
             .expect("HOT invariant violated: no matching entry found");
         let affected_child = &node.children[affected_index];
-
-        // 获取 affected entry 的 key
         let affected_key = self.get_entry_key(affected_child)?;
-
-        // 找到 diff bit
         let diff_bit =
             find_first_differing_bit(&affected_key, key).expect("Keys must be different");
         let new_bit_value = extract_bit(key, diff_bit);
+
+        // 检查节点是否已满
+        if node.len() >= 32 {
+            // 节点溢出：使用 split_with_insert（C++ 风格）
+            // 需要计算 affected subtree 信息，与 get_insert_information 一致
+            let insert_info = node.get_insert_information(affected_index, diff_bit, new_bit_value);
+            return self.handle_overflow_with_stack(
+                stack,
+                current_id,
+                &node,
+                diff_bit,
+                new_bit_value,
+                insert_info.first_index_in_affected_subtree,
+                insert_info.number_entries_in_affected_subtree,
+                insert_info.subtree_prefix_partial_key,
+                leaf_id,
+                version,
+            );
+        }
 
         // 使用 with_new_entry 创建新节点
         let new_node = node.with_new_entry(
