@@ -190,4 +190,70 @@ impl PersistentHOTNode {
             self.len() as u8,
         )
     }
+
+    /// 计算指定 indices 范围内真正区分 entries 的 bits（sparse key mask）
+    ///
+    /// 对应 C++ 的 `getRelevantBitsForRange`。
+    ///
+    /// # 算法
+    ///
+    /// 遍历相邻 entries，找出在相邻 entries 间发生变化的 bits：
+    /// ```text
+    /// relevantBits |= (mEntries[i] & ~mEntries[i - 1])
+    /// ```
+    ///
+    /// 如果某个 bit 在所有 entries 中恒定（全 0 或全 1），它不会出现在结果中。
+    ///
+    /// # 参数
+    ///
+    /// - `indices`: 要分析的 entry indices（必须已排序）
+    ///
+    /// # 返回
+    ///
+    /// sparse key 中真正区分这些 entries 的 bits 的 mask
+    #[inline]
+    pub fn get_relevant_bits_for_indices(&self, indices: &[usize]) -> u32 {
+        if indices.len() <= 1 {
+            return 0;
+        }
+
+        let mut relevant_bits = 0u32;
+        for i in 1..indices.len() {
+            let curr = self.sparse_partial_keys[indices[i]];
+            let prev = self.sparse_partial_keys[indices[i - 1]];
+            // 找出 curr 中设置了但 prev 中没设置的 bits
+            relevant_bits |= curr & !prev;
+        }
+        relevant_bits
+    }
+
+    /// 根据 relevant_bits 重建 extraction_masks
+    ///
+    /// 将 sparse key 中的 relevant bits 映射回 key bit positions，
+    /// 然后重建 extraction_masks。
+    ///
+    /// # 参数
+    ///
+    /// - `relevant_bits`: `get_relevant_bits_for_indices` 返回的 sparse key mask
+    ///
+    /// # 返回
+    ///
+    /// 新的 extraction_masks，只包含 relevant_bits 对应的 key bits
+    pub fn rebuild_extraction_masks_from_relevant_bits(&self, relevant_bits: u32) -> [u64; 4] {
+        let mut new_masks = [0u64; 4];
+
+        // 遍历所有 discriminative bits，检查它们是否在 relevant_bits 中
+        for disc_bit in self.discriminative_bits() {
+            let sparse_mask = self.get_mask_for_bit(disc_bit);
+            if (relevant_bits & sparse_mask) != 0 {
+                // 这个 bit 是 relevant 的，添加到新的 extraction_masks
+                let chunk = (disc_bit / 64) as usize;
+                let bit_in_chunk = disc_bit % 64;
+                let u64_bit_pos = 63 - bit_in_chunk;
+                new_masks[chunk] |= 1u64 << u64_bit_pos;
+            }
+        }
+
+        new_masks
+    }
 }

@@ -79,11 +79,17 @@ impl PersistentHOTNode {
 
     /// 压缩指定 entries 到新节点
     ///
-    /// 移除 root_bit 对应的 discriminative bit，重新编码 sparse keys
+    /// 按照 C++ `compressEntries` 的语义，重新计算分区内真正需要的 discriminative bits。
+    ///
+    /// # C++ 对应实现
+    ///
+    /// ```cpp
+    /// PartialKeyType relevantBits = mPartialKeys.getRelevantBitsForRange(firstIndexInRange, numberEntriesInRange);
+    /// return extractAndExecuteWithCorrectMaskAndDiscriminativeBitsRepresentation(
+    ///     mDiscriminativeBitsRepresentation, relevantBits, ...);
+    /// ```
     ///
     /// # Height 处理（与 C++ 一致）
-    ///
-    /// 新节点的 height 计算遵循 C++ `compressEntries` 的语义：
     ///
     /// - **单 entry**: 直接返回原 child pointer（不创建新节点）
     /// - **多 entries**: 新节点继承 `self.height`（不重新计算子树实际高度）
@@ -92,6 +98,7 @@ impl PersistentHOTNode {
     ///
     /// 在 debug 模式下，如果 `indices` 为空会 panic。
     /// Split 后两侧必须非空是 HOT 的不变量。
+    #[allow(unused_variables)]
     pub(super) fn compress_entries(&self, indices: &[usize], removed_bit: u16) -> SplitChild {
         debug_assert!(
             !indices.is_empty(),
@@ -107,20 +114,13 @@ impl PersistentHOTNode {
             return SplitChild::Existing(self.children[idx]);
         }
 
-        // 计算新的 extraction_masks（移除 removed_bit）
-        let chunk = (removed_bit / 64) as usize;
-        let bit_in_chunk = removed_bit % 64;
-        let u64_bit_pos = 63 - bit_in_chunk;
-        let bit_to_remove = 1u64 << u64_bit_pos;
+        // 关键修复：按 C++ 语义重新计算分区内真正需要的 discriminative bits
+        // 对应 C++ 的 getRelevantBitsForRange
+        let relevant_bits = self.get_relevant_bits_for_indices(indices);
 
-        let mut new_masks = self.extraction_masks;
-        new_masks[chunk] &= !bit_to_remove;
-
-        // 计算 compression mask（用于 PEXT 重编码 sparse keys）
-        // compression_mask = 移除 root_mask 对应位后的所有位
-        let root_sparse_mask = self.get_mask_for_bit(removed_bit);
-        let all_bits = self.get_all_mask_bits();
-        let compression_mask = all_bits & !root_sparse_mask;
+        // 根据 relevant_bits 重建 extraction_masks
+        // 对应 C++ 的 extractAndExecuteWithCorrectMaskAndDiscriminativeBitsRepresentation
+        let new_masks = self.rebuild_extraction_masks_from_relevant_bits(relevant_bits);
 
         // 计算新节点 height：继承 self.height（与 C++ 一致）
         let height = self.height;
@@ -133,10 +133,10 @@ impl PersistentHOTNode {
             children: Vec::with_capacity(indices.len()),
         };
 
+        // 使用 relevant_bits 作为 compression mask 重编码 sparse keys
         for (new_idx, &old_idx) in indices.iter().enumerate() {
-            // PEXT 重编码 sparse key
             let old_sparse = self.sparse_partial_keys[old_idx];
-            let new_sparse = pext32(old_sparse, compression_mask);
+            let new_sparse = pext32(old_sparse, relevant_bits);
             new_node.sparse_partial_keys[new_idx] = new_sparse;
             new_node.children.push(self.children[old_idx]);
         }
@@ -319,6 +319,9 @@ impl PersistentHOTNode {
     /// 这是 `compress_entries` 的变体，在压缩的同时：
     /// 1. 将 `child_index` 对应的 entry 替换为 `bi_node.left`
     /// 2. 在正确位置插入 `bi_node.right`
+    ///
+    /// 按照 C++ 语义，使用 getRelevantBitsForRange 重新计算分区内真正需要的 bits。
+    #[allow(unused_variables)]
     fn compress_entries_with_binode(
         &self,
         indices: &[usize],
@@ -337,14 +340,11 @@ impl PersistentHOTNode {
             .position(|&i| i == child_index)
             .expect("child_index must be in indices");
 
-        // 计算新的 extraction_masks（移除 removed_bit，添加 bi_node.discriminative_bit）
-        let chunk = (removed_bit / 64) as usize;
-        let bit_in_chunk = removed_bit % 64;
-        let u64_bit_pos = 63 - bit_in_chunk;
-        let bit_to_remove = 1u64 << u64_bit_pos;
+        // 关键修复：按 C++ 语义重新计算分区内真正需要的 discriminative bits
+        let relevant_bits = self.get_relevant_bits_for_indices(indices);
 
-        let mut new_masks = self.extraction_masks;
-        new_masks[chunk] &= !bit_to_remove;
+        // 根据 relevant_bits 重建 extraction_masks
+        let mut new_masks = self.rebuild_extraction_masks_from_relevant_bits(relevant_bits);
 
         // 添加 bi_node 的 discriminative_bit
         let new_bit = bi_node.discriminative_bit;
@@ -356,11 +356,6 @@ impl PersistentHOTNode {
         if is_new_bit {
             new_masks[new_chunk] |= bit_to_add;
         }
-
-        // 计算 compression mask（移除 removed_bit）
-        let root_sparse_mask = self.get_mask_for_bit(removed_bit);
-        let all_bits = self.get_all_mask_bits();
-        let compression_mask = all_bits & !root_sparse_mask;
 
         // 计算新节点 height
         let height = std::cmp::max(self.height, bi_node.height);
@@ -377,13 +372,15 @@ impl PersistentHOTNode {
         let new_bit_mask = new_node.get_mask_for_bit(new_bit);
 
         // 计算 PDEP deposit mask（如果添加了新 bit）
+        // relevant_bits.count_ones() 是压缩后的 span
         let deposit_mask = if is_new_bit {
+            let compressed_span = relevant_bits.count_ones();
             let low_mask = new_bit_mask - 1;
-            let high_mask = (compression_mask.count_ones() as u32)
-                .checked_sub(1)
-                .map(|n| (1u32 << (n + 1)) - 1)
-                .unwrap_or(0)
-                & !low_mask;
+            let high_mask = if compressed_span > 0 {
+                ((1u32 << compressed_span) - 1) & !low_mask
+            } else {
+                0
+            };
             (high_mask << 1) | low_mask
         } else {
             // bit 已存在，不需要重编码
@@ -391,12 +388,11 @@ impl PersistentHOTNode {
         };
 
         let mut new_idx = 0;
-        let mut right_inserted = false;
 
         for (pos_in_indices, &old_idx) in indices.iter().enumerate() {
-            // PEXT 重编码原 sparse key
+            // 使用 relevant_bits 作为 compression mask 重编码 sparse key
             let old_sparse = self.sparse_partial_keys[old_idx];
-            let compressed_sparse = pext32(old_sparse, compression_mask);
+            let compressed_sparse = pext32(old_sparse, relevant_bits);
 
             // 如果添加了新 bit，用 PDEP 为新 bit 留位置
             let reencoded_sparse = if is_new_bit {
@@ -418,15 +414,14 @@ impl PersistentHOTNode {
                 new_idx += 1;
 
                 // 找到 right 的插入位置（保持升序）
-                // 暂时标记需要插入 right
-                right_inserted = false;
+                let mut right_inserted = false;
 
                 // 检查是否需要在这里插入 right
                 // right_sparse 应该在后续 entries 之前还是之后？
                 // 继续处理剩余 entries，在合适位置插入 right
                 for &remaining_idx in &indices[pos_in_indices + 1..] {
                     let remaining_old_sparse = self.sparse_partial_keys[remaining_idx];
-                    let remaining_compressed = pext32(remaining_old_sparse, compression_mask);
+                    let remaining_compressed = pext32(remaining_old_sparse, relevant_bits);
                     let remaining_reencoded = if is_new_bit {
                         pdep32(remaining_compressed, deposit_mask)
                     } else {
