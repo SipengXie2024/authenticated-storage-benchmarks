@@ -32,8 +32,32 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 Ok((id, height))
             }
             SplitChild::Node(node) => {
+                // multi-entry 情况：继承父节点高度（C++ compressEntries 语义）
                 let id = node.compute_node_id::<H>(version);
                 let height = node.height;
+                self.store.put_node(&id, &node)?;
+                Ok((id, height))
+            }
+            SplitChild::TwoEntryNode {
+                discriminative_bit,
+                left,
+                right,
+            } => {
+                // single-entry 情况：精确计算高度（C++ createFromExistingAndNewEntry 语义）
+                // 高度 = max(left.height, right.height) + 1
+                let left_height = self.get_child_height(&left)?;
+                let right_height = self.get_child_height(&right)?;
+                let height = std::cmp::max(left_height, right_height) + 1;
+
+                // 创建 two-entry 节点
+                let mut node = PersistentHOTNode::empty(height);
+                node.extraction_masks =
+                    PersistentHOTNode::masks_from_bits(&[discriminative_bit]);
+                node.sparse_partial_keys[0] = 0; // left: bit = 0
+                node.sparse_partial_keys[1] = 1; // right: bit = 1
+                node.children = vec![left, right];
+
+                let id = node.compute_node_id::<H>(version);
                 self.store.put_node(&id, &node)?;
                 Ok((id, height))
             }

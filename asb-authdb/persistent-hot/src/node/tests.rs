@@ -470,10 +470,12 @@ fn test_split_basic() {
     let left = match left {
         SplitChild::Node(node) => node,
         SplitChild::Existing(_) => panic!("left should be a node"),
+        SplitChild::TwoEntryNode { .. } => panic!("left should not be TwoEntryNode"),
     };
     let right = match right {
         SplitChild::Node(node) => node,
         SplitChild::Existing(_) => panic!("right should be a node"),
+        SplitChild::TwoEntryNode { .. } => panic!("right should not be TwoEntryNode"),
     };
 
     // 验证分裂 bit
@@ -515,10 +517,12 @@ fn test_split_unbalanced() {
     let left = match left {
         SplitChild::Node(node) => node,
         SplitChild::Existing(_) => panic!("left should be a node"),
+        SplitChild::TwoEntryNode { .. } => panic!("left should not be TwoEntryNode"),
     };
     let right = match right {
         SplitChild::Existing(id) => id,
         SplitChild::Node(_) => panic!("right should be a single child"),
+        SplitChild::TwoEntryNode { .. } => panic!("right should not be TwoEntryNode"),
     };
 
     assert_eq!(disc_bit, 3);

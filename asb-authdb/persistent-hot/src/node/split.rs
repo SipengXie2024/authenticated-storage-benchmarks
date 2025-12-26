@@ -6,12 +6,25 @@ use crate::bits::{pdep32, pext32};
 
 /// Split 后的子节点表示
 ///
-/// - `Existing`: 原有 child pointer（单 entry 分区）
-/// - `Node`: 新建压缩节点（多 entry 分区）
+/// - `Existing`: 原有 child pointer（单 entry 分区，compress_entries）
+/// - `Node`: 新建压缩节点（多 entry 分区，继承父节点高度）
+/// - `TwoEntryNode`: 单 entry + 新 entry 创建的两 entry 节点（需要精确计算高度）
+///
+/// C++ 对齐：
+/// - multi-entry 继承 sourceNode.mHeight（保守估计）
+/// - single-entry 用 existingChild.getHeight() + 1（精确计算）
 #[derive(Debug, Clone)]
 pub enum SplitChild {
     Existing(NodeId),
     Node(PersistentHOTNode),
+    /// Single-entry 场景创建的两 entry 节点
+    /// 包含：(discriminative_bit, left_child, right_child)
+    /// 高度需要在 materialize 时计算为 max(left.height, right.height) + 1
+    TwoEntryNode {
+        discriminative_bit: u16,
+        left: NodeId,
+        right: NodeId,
+    },
 }
 
 impl PersistentHOTNode {
@@ -193,8 +206,9 @@ impl PersistentHOTNode {
     ) -> SplitChild {
         debug_assert!(!indices.is_empty());
 
-        // 单个 entry 且是 affected：直接创建 two-entry node
+        // 单个 entry 且是 affected：返回 TwoEntryNode，让 materialize 时精确计算高度
         // 对应 C++ compressEntriesAndAddOneEntryIntoNewNode 的 else 分支
+        // C++ 使用 createFromExistingAndNewEntry，高度 = existingChild.getHeight() + 1
         if indices.len() == 1 {
             let existing_child = self.children[indices[0]];
             let (left, right) = if new_bit_value {
@@ -202,13 +216,12 @@ impl PersistentHOTNode {
             } else {
                 (new_child, existing_child)
             };
-            // 创建 two-entry node
-            let mut node = PersistentHOTNode::empty(self.height);
-            node.extraction_masks = PersistentHOTNode::masks_from_bits(&[new_disc_bit]);
-            node.sparse_partial_keys[0] = 0; // left: bit = 0
-            node.sparse_partial_keys[1] = 1; // right: bit = 1
-            node.children = vec![left, right];
-            return SplitChild::Node(node);
+            // 返回 TwoEntryNode，高度在 materialize 时计算
+            return SplitChild::TwoEntryNode {
+                discriminative_bit: new_disc_bit,
+                left,
+                right,
+            };
         }
 
         // 多个 entries：压缩并添加新 entry
