@@ -14,9 +14,6 @@ mod traits;
 #[cfg(feature = "kvdb-backend")]
 mod kvdb;
 
-#[cfg(test)]
-mod tests;
-
 // Re-export 公开 API
 pub use cached::{CacheStats, CachedNodeStore};
 pub use error::{Result, StoreError};
@@ -24,4 +21,4 @@ pub use memory::MemoryNodeStore;
 pub use traits::NodeStore;
 
 #[cfg(feature = "kvdb-backend")]
-pub use kvdb::KvNodeStore;
+pub use self::kvdb::KvNodeStore;

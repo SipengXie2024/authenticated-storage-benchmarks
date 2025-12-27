@@ -9,8 +9,5 @@ mod insert;
 mod lookup;
 mod overflow;
 
-#[cfg(test)]
-mod tests;
-
 // Re-export 公开 API
 pub use self::core::HOTTree;

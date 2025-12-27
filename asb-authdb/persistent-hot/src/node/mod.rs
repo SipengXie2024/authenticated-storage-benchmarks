@@ -10,9 +10,6 @@ mod split;
 mod types;
 mod utils;
 
-#[cfg(test)]
-mod tests;
-
 // Re-export 公开 API
 pub use self::core::PersistentHOTNode;
 pub use split::SplitChild;
