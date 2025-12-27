@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use crate::hash::{Blake3Hasher, Hasher};
 use crate::node::{NodeId, PersistentHOTNode};
-use crate::store::NodeStore;
+use crate::store::{CachedNodeStore, NodeStore};
 
 // ============================================================================
 // Insert Stack
@@ -33,32 +33,40 @@ pub(super) struct InsertStackEntry {
 ///
 /// # 类型参数
 ///
-/// - `S`: 节点存储实现，必须实现 `NodeStore` trait
+/// - `S`: 底层存储实现，必须实现 `NodeStore` trait
 /// - `H`: 哈希算法，默认 Blake3
+///
+/// # 缓存层
+///
+/// 树操作强制经过 `CachedNodeStore<S>` 缓存层，用户传入的底层存储会被自动包装。
 ///
 /// # 版本管理
 ///
-/// `version` 不存储在结构中，而是作为 insert 参数传入，
+/// `version` 不存储在结构中，而是作为 insert 参数传入。
 pub struct HOTTree<S: NodeStore, H: Hasher = Blake3Hasher> {
-    pub(super) store: S,
+    pub(super) store: CachedNodeStore<S>,
     pub(super) root_id: Option<NodeId>,
     pub(super) _marker: PhantomData<H>,
 }
 
 impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     /// 创建空树
+    ///
+    /// 传入的底层存储会被自动包装为 `CachedNodeStore`。
     pub fn new(store: S) -> Self {
         Self {
-            store,
+            store: CachedNodeStore::new(store),
             root_id: None,
             _marker: PhantomData,
         }
     }
 
     /// 创建带有根节点的树
+    ///
+    /// 传入的底层存储会被自动包装为 `CachedNodeStore`。
     pub fn with_root(store: S, root_id: NodeId) -> Self {
         Self {
-            store,
+            store: CachedNodeStore::new(store),
             root_id: Some(root_id),
             _marker: PhantomData,
         }
@@ -70,15 +78,15 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         self.root_id.as_ref()
     }
 
-    /// 获取存储引用
+    /// 获取缓存存储引用
     #[inline]
-    pub fn store(&self) -> &S {
+    pub fn store(&self) -> &CachedNodeStore<S> {
         &self.store
     }
 
-    /// 获取可变存储引用
+    /// 获取可变缓存存储引用
     #[inline]
-    pub fn store_mut(&mut self) -> &mut S {
+    pub fn store_mut(&mut self) -> &mut CachedNodeStore<S> {
         &mut self.store
     }
 
@@ -86,5 +94,35 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.root_id.is_none()
+    }
+
+    // ========== 底层存储访问 ==========
+
+    /// 获取底层存储引用（绕过缓存层）
+    #[inline]
+    pub fn inner_store(&self) -> &S {
+        self.store.inner()
+    }
+
+    /// 获取底层存储可变引用（绕过缓存层）
+    #[inline]
+    pub fn inner_store_mut(&mut self) -> &mut S {
+        self.store.inner_mut()
+    }
+
+    // ========== 缓存操作便捷方法 ==========
+
+    /// 获取缓存统计信息
+    #[inline]
+    pub fn cache_stats(&self) -> crate::store::CacheStats {
+        self.store.stats()
+    }
+
+    /// 刷新缓存到底层存储
+    ///
+    /// 将所有脏数据写入底层存储并清空缓存。
+    #[inline]
+    pub fn flush_cache(&mut self) -> crate::store::Result<()> {
+        self.store.flush()
     }
 }

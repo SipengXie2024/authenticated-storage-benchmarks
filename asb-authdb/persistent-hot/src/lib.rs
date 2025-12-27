@@ -49,7 +49,7 @@ pub use node::{
 pub use simd::{has_avx2, simd_batch_search, simd_search, simd_search_scalar, SimdSearchResult};
 
 // store.rs 导出
-pub use store::{MemoryNodeStore, NodeStore, Result as StoreResult, StoreError};
+pub use store::{CachedNodeStore, CacheStats, MemoryNodeStore, NodeStore, Result as StoreResult, StoreError};
 
 // kvdb-backend feature 启用时导出 KvNodeStore
 #[cfg(feature = "kvdb-backend")]
