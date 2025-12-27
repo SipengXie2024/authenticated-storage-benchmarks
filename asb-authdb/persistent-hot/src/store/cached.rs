@@ -81,7 +81,7 @@ impl CacheStats {
 /// # 使用示例
 ///
 /// ```ignore
-/// let kv_store = KvNodeStore::new(db, col, version);
+/// let kv_store = KvNodeStore::new(db, col_node, col_leaf, version);
 /// let mut cached_store = CachedNodeStore::new(kv_store);
 ///
 /// // 执行操作（写入缓存）

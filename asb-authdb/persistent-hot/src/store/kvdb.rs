@@ -10,17 +10,13 @@ use super::error::{Result, StoreError};
 use super::traits::NodeStore;
 use crate::node::{LeafData, NodeId, PersistentHOTNode};
 
-/// Key 前缀：内部节点
-const KEY_PREFIX_NODE: u8 = 0x00;
-
-/// Key 前缀：叶子数据
-const KEY_PREFIX_LEAF: u8 = 0x01;
-
 /// 基于 kvdb 的节点存储
 ///
-/// Key 格式：`[prefix: 1B][version_id: 8B big-endian][node_id: 40B]`
-/// - prefix 0x00 = 内部节点
-/// - prefix 0x01 = 叶子数据
+/// 使用双 column 分离存储：
+/// - `col_node`: 存储中间节点 (Internal nodes)
+/// - `col_leaf`: 存储叶子节点 (Leaf nodes)
+///
+/// Key 格式：`[version_id: 8B big-endian][node_id: 40B]` = 48 bytes
 ///
 /// 支持多版本存储和垃圾回收
 ///
@@ -30,12 +26,13 @@ const KEY_PREFIX_LEAF: u8 = 0x01;
 /// use kvdb_memorydb;
 /// use persistent_hot::KvNodeStore;
 ///
-/// let db = Arc::new(kvdb_memorydb::create(1));
-/// let mut store = KvNodeStore::new(db, 0, 1);
+/// let db = Arc::new(kvdb_memorydb::create(2));  // 需要 2 个 column
+/// let mut store = KvNodeStore::new(db, 0, 1, 1);  // col_node=0, col_leaf=1, version=1
 /// ```
 pub struct KvNodeStore {
     db: Arc<dyn KeyValueDB>,
-    col: u32,
+    col_node: u32,
+    col_leaf: u32,
     version_id: u64,
 }
 
@@ -44,10 +41,16 @@ impl KvNodeStore {
     ///
     /// # 参数
     /// - `db`: kvdb 后端（RocksDB、MDBX、内存等）
-    /// - `col`: 使用的 column family
+    /// - `col_node`: 存储中间节点的 column family
+    /// - `col_leaf`: 存储叶子节点的 column family
     /// - `version_id`: 版本标识，用于多版本支持
-    pub fn new(db: Arc<dyn KeyValueDB>, col: u32, version_id: u64) -> Self {
-        Self { db, col, version_id }
+    pub fn new(db: Arc<dyn KeyValueDB>, col_node: u32, col_leaf: u32, version_id: u64) -> Self {
+        Self {
+            db,
+            col_node,
+            col_leaf,
+            version_id,
+        }
     }
 
     /// 获取当前版本 ID
@@ -60,41 +63,21 @@ impl KvNodeStore {
         self.version_id = version_id
     }
 
-    /// 构造内部节点存储 key
+    /// 构造存储 key
     ///
-    /// Key 格式：`[0x00][version_id: 8B][node_id: 40B]` = 49 bytes
-    fn make_node_key(&self, node_id: &NodeId) -> [u8; 49] {
-        debug_assert!(
-            node_id.is_internal(),
-            "make_node_key requires NodeId::Internal"
-        );
-        let mut key = [0u8; 49];
-        key[0] = KEY_PREFIX_NODE;
-        key[1..9].copy_from_slice(&self.version_id.to_be_bytes());
-        key[9..49].copy_from_slice(node_id.raw_bytes());
-        key
-    }
-
-    /// 构造叶子存储 key
-    ///
-    /// Key 格式：`[0x01][version_id: 8B][node_id: 40B]` = 49 bytes
-    fn make_leaf_key(&self, node_id: &NodeId) -> [u8; 49] {
-        debug_assert!(
-            node_id.is_leaf(),
-            "make_leaf_key requires NodeId::Leaf"
-        );
-        let mut key = [0u8; 49];
-        key[0] = KEY_PREFIX_LEAF;
-        key[1..9].copy_from_slice(&self.version_id.to_be_bytes());
-        key[9..49].copy_from_slice(node_id.raw_bytes());
+    /// Key 格式：`[version_id: 8B][node_id: 40B]` = 48 bytes
+    fn make_key(&self, node_id: &NodeId) -> [u8; 48] {
+        let mut key = [0u8; 48];
+        key[0..8].copy_from_slice(&self.version_id.to_be_bytes());
+        key[8..48].copy_from_slice(node_id.raw_bytes());
         key
     }
 }
 
 impl NodeStore for KvNodeStore {
     fn get_node(&self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
-        let key = self.make_node_key(id);
-        match self.db.get(self.col, &key) {
+        let key = self.make_key(id);
+        match self.db.get(self.col_node, &key) {
             Ok(Some(bytes)) => {
                 let node = PersistentHOTNode::from_bytes(&bytes)
                     .map_err(|e| StoreError::DeserializationError(e.to_string()))?;
@@ -106,21 +89,21 @@ impl NodeStore for KvNodeStore {
     }
 
     fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
-        let key = self.make_node_key(id);
+        let key = self.make_key(id);
         let bytes = node
             .to_bytes()
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
 
         let mut tx = DBTransaction::new();
-        tx.put(self.col, &key, &bytes);
+        tx.put(self.col_node, &key, &bytes);
         self.db
             .write(tx)
             .map_err(|e| StoreError::StorageError(e.to_string()))
     }
 
     fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>> {
-        let key = self.make_leaf_key(id);
-        match self.db.get(self.col, &key) {
+        let key = self.make_key(id);
+        match self.db.get(self.col_leaf, &key) {
             Ok(Some(bytes)) => {
                 let leaf = LeafData::from_bytes(&bytes)
                     .map_err(|e| StoreError::DeserializationError(e.to_string()))?;
@@ -132,13 +115,13 @@ impl NodeStore for KvNodeStore {
     }
 
     fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()> {
-        let key = self.make_leaf_key(id);
+        let key = self.make_key(id);
         let bytes = leaf
             .to_bytes()
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
 
         let mut tx = DBTransaction::new();
-        tx.put(self.col, &key, &bytes);
+        tx.put(self.col_leaf, &key, &bytes);
         self.db
             .write(tx)
             .map_err(|e| StoreError::StorageError(e.to_string()))
@@ -151,8 +134,8 @@ impl NodeStore for KvNodeStore {
     }
 
     fn contains_node(&self, id: &NodeId) -> Result<bool> {
-        let key = self.make_node_key(id);
-        match self.db.get(self.col, &key) {
+        let key = self.make_key(id);
+        match self.db.get(self.col_node, &key) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
             Err(e) => Err(StoreError::StorageError(e.to_string())),
@@ -160,8 +143,8 @@ impl NodeStore for KvNodeStore {
     }
 
     fn contains_leaf(&self, id: &NodeId) -> Result<bool> {
-        let key = self.make_leaf_key(id);
-        match self.db.get(self.col, &key) {
+        let key = self.make_key(id);
+        match self.db.get(self.col_leaf, &key) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
             Err(e) => Err(StoreError::StorageError(e.to_string())),
