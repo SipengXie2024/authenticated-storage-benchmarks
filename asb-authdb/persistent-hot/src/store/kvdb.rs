@@ -15,9 +15,7 @@ use crate::node::{LeafData, NodeId, PersistentHOTNode};
 /// - `col_node`: 存储中间节点 (Internal nodes)
 /// - `col_leaf`: 存储叶子节点 (Leaf nodes)
 ///
-/// Key 格式：`[version_id: 8B big-endian][node_id: 40B]` = 48 bytes
-///
-/// 支持多版本存储和垃圾回收
+/// Key 格式：直接使用 NodeId 的 40 字节（version 8B + content_hash 32B）
 ///
 /// # 示例
 ///
@@ -42,7 +40,7 @@ impl KvNodeStore {
     /// - `db`: kvdb 后端（RocksDB、MDBX、内存等）
     /// - `col_node`: 存储中间节点的 column family
     /// - `col_leaf`: 存储叶子节点的 column family
-    /// - `version_id`: 版本标识，用于多版本支持
+    /// - `version_id`: 版本标识（仅用于 HOTTree 内部追踪）
     pub fn new(db: Arc<dyn KeyValueDB>, col_node: u32, col_leaf: u32, version_id: u64) -> Self {
         Self {
             db,
@@ -61,23 +59,12 @@ impl KvNodeStore {
     pub fn set_version_id(&mut self, version_id: u64) {
         self.version_id = version_id
     }
-
-    /// 构造存储 key
-    ///
-    /// Key 格式：`[version_id: 8B][node_id: 40B]` = 48 bytes
-    fn make_key(&self, node_id: &NodeId) -> [u8; 48] {
-        let mut key = [0u8; 48];
-        key[0..8].copy_from_slice(&self.version_id.to_be_bytes());
-        key[8..48].copy_from_slice(node_id.raw_bytes());
-        key
-    }
 }
 
 impl KvNodeStore {
     /// 获取内部节点
     pub fn get_node(&self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
-        let key = self.make_key(id);
-        match self.db.get(self.col_node, &key) {
+        match self.db.get(self.col_node, id.raw_bytes()) {
             Ok(Some(bytes)) => {
                 let node = PersistentHOTNode::from_bytes(&bytes)
                     .map_err(|e| StoreError::DeserializationError(e.to_string()))?;
@@ -90,13 +77,12 @@ impl KvNodeStore {
 
     /// 存储内部节点
     pub fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
-        let key = self.make_key(id);
         let bytes = node
             .to_bytes()
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
 
         let mut tx = DBTransaction::new();
-        tx.put(self.col_node, &key, &bytes);
+        tx.put(self.col_node, id.raw_bytes(), &bytes);
         self.db
             .write(tx)
             .map_err(|e| StoreError::StorageError(e.to_string()))
@@ -104,8 +90,7 @@ impl KvNodeStore {
 
     /// 获取叶子数据
     pub fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>> {
-        let key = self.make_key(id);
-        match self.db.get(self.col_leaf, &key) {
+        match self.db.get(self.col_leaf, id.raw_bytes()) {
             Ok(Some(bytes)) => {
                 let leaf = LeafData::from_bytes(&bytes)
                     .map_err(|e| StoreError::DeserializationError(e.to_string()))?;
@@ -118,13 +103,12 @@ impl KvNodeStore {
 
     /// 存储叶子数据
     pub fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()> {
-        let key = self.make_key(id);
         let bytes = leaf
             .to_bytes()
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
 
         let mut tx = DBTransaction::new();
-        tx.put(self.col_leaf, &key, &bytes);
+        tx.put(self.col_leaf, id.raw_bytes(), &bytes);
         self.db
             .write(tx)
             .map_err(|e| StoreError::StorageError(e.to_string()))
@@ -139,8 +123,7 @@ impl KvNodeStore {
 
     /// 检查内部节点是否存在
     pub fn contains_node(&self, id: &NodeId) -> Result<bool> {
-        let key = self.make_key(id);
-        match self.db.get(self.col_node, &key) {
+        match self.db.get(self.col_node, id.raw_bytes()) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
             Err(e) => Err(StoreError::StorageError(e.to_string())),
@@ -149,8 +132,7 @@ impl KvNodeStore {
 
     /// 检查叶子是否存在
     pub fn contains_leaf(&self, id: &NodeId) -> Result<bool> {
-        let key = self.make_key(id);
-        match self.db.get(self.col_leaf, &key) {
+        match self.db.get(self.col_leaf, id.raw_bytes()) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
             Err(e) => Err(StoreError::StorageError(e.to_string())),

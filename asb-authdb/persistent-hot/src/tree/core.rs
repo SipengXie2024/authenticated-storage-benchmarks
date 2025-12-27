@@ -132,15 +132,9 @@ impl<H: Hasher> HOTTree<H> {
     ///
     /// # 语义
     ///
-    /// - commit(0) 后，version 变为 1
-    /// - commit(1) 后，version 变为 2
-    /// - 依此类推
+    /// - commit(N) 后，version 变为 N + 1
+    /// - 不要求 epoch 严格连续（兼容 benchmark 框架）
     pub fn commit(&mut self, epoch: u64) {
-        assert_eq!(
-            epoch, self.version,
-            "commit epoch mismatch: expected {}, got {}",
-            self.version, epoch
-        );
         self.version = epoch + 1;
         // 同步更新 store 的 version_id
         self.store.set_version_id(self.version);
