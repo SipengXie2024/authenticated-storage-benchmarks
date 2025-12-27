@@ -145,7 +145,8 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     } else {
                         // ===== CASE 3: Normal Insert =====
                         // 受影响子树有多个 entries，在当前节点添加新 entry
-                        let new_node_id = self.normal_insert(
+                        // normal_insert 内部完成所有指针传播
+                        return self.normal_insert(
                             &mut stack,
                             current_id,
                             node,
@@ -153,13 +154,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                             &insert_info,
                             leaf_id,
                             version,
-                        )?;
-                        return self.propagate_pointer_updates(stack, new_node_id, version);
+                        );
                     }
                 }
                 SearchResult::NotFound { dense_key } => {
                     // 没有匹配的 entry：需要添加新 entry
-                    let new_node_id = self.add_entry_to_node_with_stack(
+                    // add_entry_to_node_with_stack 内部完成所有指针传播
+                    return self.add_entry_to_node_with_stack(
                         &mut stack,
                         current_id,
                         node,
@@ -167,10 +168,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                         dense_key,
                         leaf_id,
                         version,
-                    )?;
-
-                    // 向上传播更新
-                    return self.propagate_pointer_updates(stack, new_node_id, version);
+                    );
                 }
             }
         }
@@ -277,14 +275,8 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     node: parent_node,
                 });
 
-                let result_id = self.integrate_binode_upwards(stack, &mut bi_node, version)?;
-
-                // integrate_binode_upwards 已经处理了 root_id 更新，直接返回
-                if self.root_id.as_ref() == Some(&result_id) {
-                    Ok(())
-                } else {
-                    self.propagate_pointer_updates(std::mem::take(stack), result_id, version)
-                }
+                // integrate_binode_upwards 内部完成所有指针传播，无需再调用 propagate_pointer_updates
+                self.integrate_binode_upwards(stack, &mut bi_node, version)
             }
         }
     }
@@ -293,6 +285,8 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     ///
     /// 当 `isSingleEntry == false` 时使用，对应 C++ `insertNewValue`。
     /// 新 key 影响多个 entries，需要在当前节点添加新的 discriminative bit。
+    ///
+    /// 注意：此函数内部完成所有指针传播，调用者无需再调用 propagate_pointer_updates。
     ///
     /// # 参数
     ///
@@ -312,10 +306,10 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         insert_info: &InsertInformation,
         leaf_id: NodeId,
         version: u64,
-    ) -> Result<NodeId> {
+    ) -> Result<()> {
         // 检查节点是否已满
         if node.len() >= 32 {
-            // 节点溢出：使用 key 来在 split 后的子节点中重新计算 InsertInformation
+            // 节点溢出：handle_overflow_normal_insert 内部完成所有更新
             return self.handle_overflow_normal_insert(
                 stack,
                 current_id,
@@ -333,10 +327,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         let new_node_id = new_node.compute_node_id::<H>(version);
         self.store.put_node(&new_node_id, &new_node)?;
-        Ok(new_node_id)
+        // 非 overflow：自己调用 propagate_pointer_updates
+        self.propagate_pointer_updates(std::mem::take(stack), new_node_id, version)
     }
 
     /// 向节点添加新 entry（带栈支持）
+    ///
+    /// 注意：此函数内部完成所有指针传播，调用者无需再调用 propagate_pointer_updates。
     pub(super) fn add_entry_to_node_with_stack(
         &mut self,
         stack: &mut Vec<InsertStackEntry>,
@@ -346,7 +343,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         dense_key: u32,
         leaf_id: NodeId,
         version: u64,
-    ) -> Result<NodeId> {
+    ) -> Result<()> {
         // 先计算 affected_index 和 disc_bit（无论是否 overflow 都需要）
         let affected_index = self
             .find_affected_entry(&node, dense_key)
@@ -359,8 +356,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // 检查节点是否已满
         if node.len() >= 32 {
-            // 节点溢出：使用 split_with_insert（C++ 风格）
-            // 需要计算 affected subtree 信息，与 get_insert_information 一致
+            // 节点溢出：handle_overflow_with_stack 内部完成所有更新
             let insert_info = node.get_insert_information(affected_index, diff_bit, new_bit_value);
             return self.handle_overflow_with_stack(
                 stack,
@@ -386,6 +382,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         let new_node_id = new_node.compute_node_id::<H>(version);
         self.store.put_node(&new_node_id, &new_node)?;
-        Ok(new_node_id)
+        // 非 overflow：自己调用 propagate_pointer_updates
+        self.propagate_pointer_updates(std::mem::take(stack), new_node_id, version)
     }
 }
