@@ -304,6 +304,7 @@ dependencies = [
  "parity-journaldb",
  "parity-scale-codec",
  "patricia-trie-ethereum",
+ "persistent-hot",
  "primitive-types 0.7.3",
  "primitives",
  "rainblock-trie",

@@ -69,7 +69,7 @@ mod authdb_impl {
     use authdb_trait::AuthDB;
 
     impl<H: Hasher + 'static> AuthDB for HOTTree<H> {
-        fn get(&mut self, key: Vec<u8>) -> Option<Box<[u8]>> {
+        fn get(&self, key: Vec<u8>) -> Option<Box<[u8]>> {
             let key: [u8; 32] = key.try_into().ok()?;
             self.lookup(&key).ok()?.map(|v| v.into_boxed_slice())
         }

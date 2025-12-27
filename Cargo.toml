@@ -53,6 +53,7 @@ lvmt-db = { path = "asb-authdb/lvmt-db", features = ["large_lvmt"] }
 parity-journaldb = { path = "asb-authdb/parity-journaldb" }
 patricia-trie-ethereum = { path = "asb-authdb/patricia-trie-ethereum" }
 rainblock-trie = { path = "asb-authdb/rainblock-trie" }
+persistent-hot = { path = "asb-authdb/persistent-hot", features = ["kvdb-backend", "authdb"] }
 
 # Utils
 parity-scale-codec = "1.3.5"

@@ -18,7 +18,7 @@ impl<H: Hasher> HOTTree<H> {
     /// - `Ok(Some(value))`: 找到匹配的 key，返回 value
     /// - `Ok(None)`: key 不存在或假阳性（partial key 匹配但完整 key 不匹配）
     /// - `Err(_)`: 存储错误
-    pub fn lookup(&mut self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    pub fn lookup(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let root_id = match &self.root_id {
             Some(id) => id.clone(),
             None => return Ok(None),
@@ -27,7 +27,7 @@ impl<H: Hasher> HOTTree<H> {
     }
 
     /// 内部递归查找
-    fn lookup_internal(&mut self, node_id: &NodeId, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    fn lookup_internal(&self, node_id: &NodeId, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let node = self
             .store
             .get_node(node_id)?

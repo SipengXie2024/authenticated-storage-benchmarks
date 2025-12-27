@@ -5,6 +5,7 @@
 //! - put 操作：直接写入缓存（标记为 Dirty）
 //! - flush 操作：将所有 Dirty 条目写入底层存储，然后清空缓存
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -101,15 +102,16 @@ impl CacheStats {
 /// - **Write-Back**: put 操作只写入缓存，flush 时批量写入底层
 /// - **Clean/Dirty 状态**: 区分从存储读取的干净数据和新写入的脏数据
 /// - **LVMT 风格清空**: flush 后清空所有缓存条目
+/// - **内部可变性**: 使用 RefCell 支持 `&self` 读取操作（适用于单线程 benchmark）
 pub struct CachedNodeStore {
     /// 底层 kvdb 存储
     inner: KvNodeStore,
-    /// 内部节点缓存（无锁）
-    node_cache: HashMap<NodeId, CacheState<PersistentHOTNode>>,
-    /// 叶子缓存（无锁）
-    leaf_cache: HashMap<NodeId, CacheState<LeafData>>,
-    /// 缓存统计
-    stats: CacheStats,
+    /// 内部节点缓存（RefCell 支持内部可变性）
+    node_cache: RefCell<HashMap<NodeId, CacheState<PersistentHOTNode>>>,
+    /// 叶子缓存（RefCell 支持内部可变性）
+    leaf_cache: RefCell<HashMap<NodeId, CacheState<LeafData>>>,
+    /// 缓存统计（RefCell 支持内部可变性）
+    stats: RefCell<CacheStats>,
 }
 
 impl CachedNodeStore {
@@ -123,30 +125,30 @@ impl CachedNodeStore {
     pub fn new(db: Arc<dyn KeyValueDB>, col_node: u32, col_leaf: u32, version_id: u64) -> Self {
         Self {
             inner: KvNodeStore::new(db, col_node, col_leaf, version_id),
-            node_cache: HashMap::new(),
-            leaf_cache: HashMap::new(),
-            stats: CacheStats::default(),
+            node_cache: RefCell::new(HashMap::new()),
+            leaf_cache: RefCell::new(HashMap::new()),
+            stats: RefCell::new(CacheStats::default()),
         }
     }
 
     /// 获取缓存统计的副本
     pub fn stats(&self) -> CacheStats {
-        self.stats.clone()
+        self.stats.borrow().clone()
     }
 
     /// 重置统计
     pub fn reset_stats(&mut self) {
-        self.stats = CacheStats::default();
+        *self.stats.borrow_mut() = CacheStats::default();
     }
 
     /// 获取当前缓存的节点数
     pub fn cached_node_count(&self) -> usize {
-        self.node_cache.len()
+        self.node_cache.borrow().len()
     }
 
     /// 获取当前缓存的叶子数
     pub fn cached_leaf_count(&self) -> usize {
-        self.leaf_cache.len()
+        self.leaf_cache.borrow().len()
     }
 
     /// 获取底层存储的不可变引用
@@ -170,19 +172,19 @@ impl CachedNodeStore {
     }
 
     /// 获取内部节点
-    pub fn get_node(&mut self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
+    pub fn get_node(&self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
         // 1. 先查缓存
-        if let Some(state) = self.node_cache.get(id) {
-            self.stats.node_hits += 1;
+        if let Some(state) = self.node_cache.borrow().get(id) {
+            self.stats.borrow_mut().node_hits += 1;
             return Ok(Some(state.value().clone()));
         }
 
         // 2. 缓存未命中，读取底层
-        self.stats.node_misses += 1;
+        self.stats.borrow_mut().node_misses += 1;
         match self.inner.get_node(id)? {
             Some(node) => {
                 // 缓存读取结果（干净状态）
-                self.node_cache.insert(*id, CacheState::Clean(node.clone()));
+                self.node_cache.borrow_mut().insert(*id, CacheState::Clean(node.clone()));
                 Ok(Some(node))
             }
             None => Ok(None),
@@ -190,25 +192,25 @@ impl CachedNodeStore {
     }
 
     /// 存储内部节点
-    pub fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
+    pub fn put_node(&self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
         // 直接放入缓存，标记为脏
-        self.node_cache.insert(*id, CacheState::Dirty(node.clone()));
+        self.node_cache.borrow_mut().insert(*id, CacheState::Dirty(node.clone()));
         Ok(())
     }
 
     /// 获取叶子数据
-    pub fn get_leaf(&mut self, id: &NodeId) -> Result<Option<LeafData>> {
+    pub fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>> {
         // 1. 先查缓存
-        if let Some(state) = self.leaf_cache.get(id) {
-            self.stats.leaf_hits += 1;
+        if let Some(state) = self.leaf_cache.borrow().get(id) {
+            self.stats.borrow_mut().leaf_hits += 1;
             return Ok(Some(state.value().clone()));
         }
 
         // 2. 缓存未命中，读取底层
-        self.stats.leaf_misses += 1;
+        self.stats.borrow_mut().leaf_misses += 1;
         match self.inner.get_leaf(id)? {
             Some(leaf) => {
-                self.leaf_cache.insert(*id, CacheState::Clean(leaf.clone()));
+                self.leaf_cache.borrow_mut().insert(*id, CacheState::Clean(leaf.clone()));
                 Ok(Some(leaf))
             }
             None => Ok(None),
@@ -216,8 +218,8 @@ impl CachedNodeStore {
     }
 
     /// 存储叶子数据
-    pub fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()> {
-        self.leaf_cache.insert(*id, CacheState::Dirty(leaf.clone()));
+    pub fn put_leaf(&self, id: &NodeId, leaf: &LeafData) -> Result<()> {
+        self.leaf_cache.borrow_mut().insert(*id, CacheState::Dirty(leaf.clone()));
         Ok(())
     }
 
@@ -226,6 +228,7 @@ impl CachedNodeStore {
         // 1. 写入脏节点到底层存储
         let dirty_nodes: Vec<_> = self
             .node_cache
+            .borrow()
             .iter()
             .filter(|(_, state)| state.is_dirty())
             .map(|(id, state)| (*id, state.value().clone()))
@@ -238,6 +241,7 @@ impl CachedNodeStore {
         // 2. 写入脏叶子到底层存储
         let dirty_leaves: Vec<_> = self
             .leaf_cache
+            .borrow()
             .iter()
             .filter(|(_, state)| state.is_dirty())
             .map(|(id, state)| (*id, state.value().clone()))
@@ -248,21 +252,24 @@ impl CachedNodeStore {
         }
 
         // 3. 更新统计
-        self.stats.nodes_flushed += dirty_nodes.len() as u64;
-        self.stats.leaves_flushed += dirty_leaves.len() as u64;
+        {
+            let mut stats = self.stats.borrow_mut();
+            stats.nodes_flushed += dirty_nodes.len() as u64;
+            stats.leaves_flushed += dirty_leaves.len() as u64;
+        }
 
         // 4. 清空缓存（LVMT 风格）
-        self.node_cache.clear();
-        self.leaf_cache.clear();
+        self.node_cache.borrow_mut().clear();
+        self.leaf_cache.borrow_mut().clear();
 
         // 5. 调用底层 flush
         self.inner.flush()
     }
 
     /// 检查内部节点是否存在
-    pub fn contains_node(&mut self, id: &NodeId) -> Result<bool> {
+    pub fn contains_node(&self, id: &NodeId) -> Result<bool> {
         // 先查缓存
-        if self.node_cache.contains_key(id) {
+        if self.node_cache.borrow().contains_key(id) {
             return Ok(true);
         }
         // 再查底层
@@ -270,8 +277,8 @@ impl CachedNodeStore {
     }
 
     /// 检查叶子是否存在
-    pub fn contains_leaf(&mut self, id: &NodeId) -> Result<bool> {
-        if self.leaf_cache.contains_key(id) {
+    pub fn contains_leaf(&self, id: &NodeId) -> Result<bool> {
+        if self.leaf_cache.borrow().contains_key(id) {
             return Ok(true);
         }
         self.inner.contains_leaf(id)
@@ -338,7 +345,7 @@ mod tests {
         store.inner_mut().put_node(&id, &node).unwrap();
 
         // 清空缓存
-        store.node_cache.clear();
+        store.node_cache.borrow_mut().clear();
 
         // 第一次 get：缓存未命中，读取底层
         let retrieved1 = store.get_node(&id).unwrap();

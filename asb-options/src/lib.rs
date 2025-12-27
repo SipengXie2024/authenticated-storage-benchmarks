@@ -97,6 +97,7 @@ impl Options {
     pub fn num_cols(&self) -> u32 {
         match self.algorithm {
             AuthAlgo::LVMT => 3,
+            AuthAlgo::HOT | AuthAlgo::HOTKeccak => 2,
             _ => 1,
         }
     }
@@ -111,6 +112,8 @@ pub enum AuthAlgo {
     MPT,
     LMPTS,
     RAIN,
+    HOT,
+    HOTKeccak,
 }
 
 fn parse_algo(s: &str) -> Result<AuthAlgo, String> {
@@ -124,6 +127,8 @@ fn parse_algo(s: &str) -> Result<AuthAlgo, String> {
         "mpt" => AuthAlgo::MPT,
         "lmpts" => AuthAlgo::LMPTS,
         "rain" => AuthAlgo::RAIN,
+        "hot" => AuthAlgo::HOT,
+        "hot-keccak" => AuthAlgo::HOTKeccak,
         _ => {
             return Err("Unrecognized algorithm".into());
         }

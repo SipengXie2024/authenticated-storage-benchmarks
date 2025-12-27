@@ -1,4 +1,5 @@
 mod amt;
+mod hot;
 #[cfg(feature = "lmpts")]
 mod lmpts;
 mod lvmt;
@@ -47,6 +48,14 @@ pub fn new<'a>(backend: Arc<dyn KeyValueDB>, opts: &'a Options) -> (Box<dyn Auth
         }
         AuthAlgo::RAIN => (
             Box::new(rain_mpt::new(backend)),
+            Box::new(Counter::default()),
+        ),
+        AuthAlgo::HOT => (
+            Box::new(hot::new_blake3(backend)),
+            Box::new(Counter::default()),
+        ),
+        AuthAlgo::HOTKeccak => (
+            Box::new(hot::new_keccak(backend)),
             Box::new(Counter::default()),
         ),
     };
