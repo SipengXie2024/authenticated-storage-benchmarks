@@ -82,10 +82,9 @@ mod authdb_impl {
         }
 
         fn commit(&mut self, index: usize) {
-            // 调用 HOTTree::commit，严格校验 epoch
+            // 调用 HOTTree::commit，更新版本号
             HOTTree::commit(self, index as u64);
-            // 刷新缓存到底层存储
-            self.flush_cache().expect("flush failed");
+            // 不在 commit 时 flush，与 LVMT 行为保持一致
         }
 
         fn flush_all(&mut self) {
