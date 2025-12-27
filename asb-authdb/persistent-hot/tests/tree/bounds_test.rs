@@ -25,8 +25,8 @@ fn test_min_max_keys() {
     let min_key = [0u8; 32];
     let max_key = [0xFFu8; 32];
 
-    tree.insert(&min_key, b"min".to_vec(), 1).unwrap();
-    tree.insert(&max_key, b"max".to_vec(), 1).unwrap();
+    tree.insert(&min_key, b"min".to_vec()).unwrap();
+    tree.insert(&max_key, b"max".to_vec()).unwrap();
 
     assert!(tree.lookup(&min_key).unwrap().is_some());
     assert!(tree.lookup(&max_key).unwrap().is_some());
@@ -43,7 +43,7 @@ fn test_adjacent_keys() {
     for i in 0..32u8 {
         let mut key = [0u8; 32];
         key[0] = i;
-        tree.insert(&key, format!("value_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("value_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -64,14 +64,14 @@ fn test_single_bit_difference() {
 
     // 基准键
     let base_key = [0u8; 32];
-    tree.insert(&base_key, b"base".to_vec(), 1).unwrap();
+    tree.insert(&base_key, b"base".to_vec()).unwrap();
 
     // 每个字节的每个 bit 位不同的键
     for byte_idx in 0..32 {
         for bit_idx in 0..8 {
             let mut key = [0u8; 32];
             key[byte_idx] = 1 << bit_idx;
-            tree.insert(&key, format!("bit_{}_{}", byte_idx, bit_idx).into_bytes(), 1)
+            tree.insert(&key, format!("bit_{}_{}", byte_idx, bit_idx).into_bytes())
                 .unwrap();
         }
     }
@@ -107,7 +107,7 @@ fn test_common_prefix_keys() {
         key[..16].copy_from_slice(&prefix);
         key[16] = (i >> 8) as u8;
         key[17] = (i & 0xFF) as u8;
-        tree.insert(&key, format!("prefix_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("prefix_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -133,7 +133,7 @@ fn test_sparse_keys() {
         let mut key = [0u8; 32];
         key[0] = i as u8;
         key[31] = (255 - i) as u8;
-        tree.insert(&key, format!("sparse_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("sparse_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -155,7 +155,7 @@ fn test_clustered_keys() {
     for i in 0..256 {
         let mut key = [0u8; 32];
         key[0] = i as u8;
-        tree.insert(&key, format!("clustered_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("clustered_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -175,7 +175,7 @@ fn test_keys_differ_in_last_byte() {
     for i in 0..256 {
         let mut key = [0xFFu8; 32];
         key[31] = i as u8;
-        tree.insert(&key, format!("last_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("last_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -198,7 +198,7 @@ fn test_split_boundary() {
     for i in 0..33 {
         let mut key = [0u8; 32];
         key[0] = i as u8;
-        tree.insert(&key, format!("split_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("split_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -222,7 +222,7 @@ fn test_multi_level_split() {
         let mut key = [0u8; 32];
         key[0] = ((i >> 8) & 0xFF) as u8;
         key[1] = (i & 0xFF) as u8;
-        tree.insert(&key, format!("multi_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("multi_{}", i).into_bytes())
             .unwrap();
     }
 

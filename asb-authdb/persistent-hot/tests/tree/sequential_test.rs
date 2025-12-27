@@ -28,7 +28,7 @@ fn test_sequential_insert_100() {
 
     for (i, key) in keys.iter().enumerate() {
         let value = format!("value_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Insert {} should succeed", i);
     }
 
@@ -51,7 +51,7 @@ fn test_sequential_insert_1000() {
 
     for (i, key) in keys.iter().enumerate() {
         let value = format!("value_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Insert {} should succeed", i);
     }
 
@@ -72,7 +72,7 @@ fn test_sequential_insert_10000() {
 
     for (i, key) in keys.iter().enumerate() {
         let value = format!("value_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Insert {} should succeed", i);
     }
 
@@ -94,7 +94,7 @@ fn test_reverse_insert() {
     // 逆序插入
     for (i, key) in keys.iter().rev().enumerate() {
         let value = format!("reverse_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Reverse insert {} should succeed", i);
     }
 
@@ -116,12 +116,12 @@ fn test_alternating_insert() {
     // 交替插入：先偶数，后奇数
     for i in (0..1000).step_by(2) {
         let value = format!("even_{}", i).into_bytes();
-        tree.insert(&keys[i], value, 1).unwrap();
+        tree.insert(&keys[i], value).unwrap();
     }
 
     for i in (1..1000).step_by(2) {
         let value = format!("odd_{}", i).into_bytes();
-        tree.insert(&keys[i], value, 1).unwrap();
+        tree.insert(&keys[i], value).unwrap();
     }
 
     // 验证
@@ -147,7 +147,7 @@ fn test_single_element_tree() {
     let mut tree = create_test_tree();
 
     let key = [42u8; 32];
-    tree.insert(&key, b"single".to_vec(), 1).unwrap();
+    tree.insert(&key, b"single".to_vec()).unwrap();
 
     assert!(tree.lookup(&key).unwrap().is_some());
 

@@ -24,7 +24,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     pub(super) fn materialize_split_child_with_height(
         &mut self,
         child: SplitChild,
-        version: u64,
     ) -> Result<(NodeId, u8)> {
         match child {
             SplitChild::Existing(id) => {
@@ -33,7 +32,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             }
             SplitChild::Node(node) => {
                 // multi-entry 情况：继承父节点高度（C++ compressEntries 语义）
-                let id = node.compute_node_id::<H>(version);
+                let id = node.compute_node_id::<H>(self.version);
                 let height = node.height;
                 self.store.put_node(&id, &node)?;
                 Ok((id, height))
@@ -57,7 +56,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 node.sparse_partial_keys[1] = 1; // right: bit = 1
                 node.children = vec![left, right];
 
-                let id = node.compute_node_id::<H>(version);
+                let id = node.compute_node_id::<H>(self.version);
                 self.store.put_node(&id, &node)?;
                 Ok((id, height))
             }
@@ -71,7 +70,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         &mut self,
         mut stack: Vec<InsertStackEntry>,
         mut new_child_id: NodeId,
-        version: u64,
     ) -> Result<()> {
         while let Some(entry) = stack.pop() {
             // 更新父节点的 child 引用
@@ -83,7 +81,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 new_node.height = std::cmp::max(new_node.height, child.height + 1);
             }
 
-            let new_node_id = new_node.compute_node_id::<H>(version);
+            let new_node_id = new_node.compute_node_id::<H>(self.version);
             self.store.put_node(&new_node_id, &new_node)?;
             new_child_id = new_node_id;
         }

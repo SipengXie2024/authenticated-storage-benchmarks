@@ -28,7 +28,7 @@ fn test_random_insert_100() {
 
     for (i, key) in keys.iter().enumerate() {
         let value = format!("random_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Random insert {} should succeed", i);
     }
 
@@ -49,7 +49,7 @@ fn test_random_insert_1000() {
 
     for (i, key) in keys.iter().enumerate() {
         let value = format!("random_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Random insert {} should succeed", i);
     }
 
@@ -70,7 +70,7 @@ fn test_random_insert_10000() {
 
     for (i, key) in keys.iter().enumerate() {
         let value = format!("random_{}", i).into_bytes();
-        let result = tree.insert(key, value, 1);
+        let result = tree.insert(key, value);
         assert!(result.is_ok(), "Random insert {} should succeed", i);
     }
 
@@ -91,7 +91,7 @@ fn test_multiple_random_seeds() {
 
         for (i, key) in keys.iter().enumerate() {
             let value = format!("seed{}_{}", seed, i).into_bytes();
-            tree.insert(key, value, 1).unwrap();
+            tree.insert(key, value).unwrap();
         }
 
         for key in &keys {
@@ -112,7 +112,7 @@ fn test_random_lookup_nonexistent() {
     // 插入一批键
     let inserted_keys = get_random_keys(100, 11111);
     for (i, key) in inserted_keys.iter().enumerate() {
-        tree.insert(key, format!("v{}", i).into_bytes(), 1).unwrap();
+        tree.insert(key, format!("v{}", i).into_bytes()).unwrap();
     }
 
     // 查询另一批随机键（很可能不存在）
@@ -141,8 +141,8 @@ fn test_mixed_random_sequential() {
 
     // 交替插入
     for i in 0..500 {
-        tree.insert(&random_keys[i], b"random".to_vec(), 1).unwrap();
-        tree.insert(&sequential_keys[i], b"sequential".to_vec(), 1).unwrap();
+        tree.insert(&random_keys[i], b"random".to_vec()).unwrap();
+        tree.insert(&sequential_keys[i], b"sequential".to_vec()).unwrap();
     }
 
     // 验证

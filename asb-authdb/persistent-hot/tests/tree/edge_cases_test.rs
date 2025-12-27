@@ -23,11 +23,11 @@ fn test_duplicate_key_insert() {
     let key = [42u8; 32];
 
     // 第一次插入
-    let result1 = tree.insert(&key, b"first".to_vec(), 1);
+    let result1 = tree.insert(&key, b"first".to_vec());
     assert!(result1.is_ok());
 
-    // 第二次插入相同键
-    let result2 = tree.insert(&key, b"second".to_vec(), 2);
+    // 第二次插入相同键（同一个 epoch 内）
+    let result2 = tree.insert(&key, b"second".to_vec());
     // 行为取决于实现：可能成功（更新）或返回错误
     // 这里只验证不会 panic
     let _ = result2;
@@ -39,7 +39,7 @@ fn test_all_zero_key() {
     let mut tree = create_test_tree();
 
     let key = [0u8; 32];
-    tree.insert(&key, b"zero".to_vec(), 1).unwrap();
+    tree.insert(&key, b"zero".to_vec()).unwrap();
     assert!(tree.lookup(&key).unwrap().is_some());
 }
 
@@ -49,7 +49,7 @@ fn test_all_ff_key() {
     let mut tree = create_test_tree();
 
     let key = [0xFFu8; 32];
-    tree.insert(&key, b"max".to_vec(), 1).unwrap();
+    tree.insert(&key, b"max".to_vec()).unwrap();
     assert!(tree.lookup(&key).unwrap().is_some());
 }
 
@@ -63,8 +63,8 @@ fn test_alternating_pattern_keys() {
     // 0xAA = 0b10101010
     let key2 = [0xAAu8; 32];
 
-    tree.insert(&key1, b"pattern1".to_vec(), 1).unwrap();
-    tree.insert(&key2, b"pattern2".to_vec(), 1).unwrap();
+    tree.insert(&key1, b"pattern1".to_vec()).unwrap();
+    tree.insert(&key2, b"pattern2".to_vec()).unwrap();
 
     assert!(tree.lookup(&key1).unwrap().is_some());
     assert!(tree.lookup(&key2).unwrap().is_some());
@@ -76,7 +76,7 @@ fn test_empty_value() {
     let mut tree = create_test_tree();
 
     let key = [1u8; 32];
-    tree.insert(&key, b"".to_vec(), 1).unwrap();
+    tree.insert(&key, b"".to_vec()).unwrap();
     assert!(tree.lookup(&key).unwrap().is_some());
 }
 
@@ -87,7 +87,7 @@ fn test_large_value() {
 
     let key = [1u8; 32];
     let large_value = vec![0xABu8; 10000];
-    tree.insert(&key, large_value, 1).unwrap();
+    tree.insert(&key, large_value).unwrap();
     assert!(tree.lookup(&key).unwrap().is_some());
 }
 
@@ -101,7 +101,7 @@ fn test_interleaved_insert_lookup() {
         key[0] = i as u8;
 
         // 插入
-        tree.insert(&key, format!("value_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("value_{}", i).into_bytes())
             .unwrap();
 
         // 立即查询
@@ -127,7 +127,7 @@ fn test_high_entropy_keys() {
         for j in 0..32 {
             key[j] = ((i * 17 + j * 31) % 256) as u8;
         }
-        tree.insert(&key, format!("entropy_{}", i).into_bytes(), 1)
+        tree.insert(&key, format!("entropy_{}", i).into_bytes())
             .unwrap();
     }
 
@@ -141,22 +141,28 @@ fn test_high_entropy_keys() {
     }
 }
 
-/// 测试：递增版本号
+/// 测试：跨 epoch 插入
+///
+/// 原测试使用不同 version 参数，现改为使用 commit() 推进 epoch
 #[test]
-fn test_increasing_versions() {
+fn test_cross_epoch_inserts() {
     let mut tree = create_test_tree();
 
-    for version in 1..=100 {
-        let mut key = [0u8; 32];
-        key[0] = version as u8;
-        tree.insert(&key, format!("v{}", version).into_bytes(), version as u64)
-            .unwrap();
+    // 每 10 个插入后 commit 一次，共 10 个 epoch
+    for epoch in 0..10 {
+        for i in 0..10 {
+            let mut key = [0u8; 32];
+            key[0] = (epoch * 10 + i) as u8;
+            tree.insert(&key, format!("epoch_{}_item_{}", epoch, i).into_bytes())
+                .unwrap();
+        }
+        tree.commit(epoch as u64);
     }
 
-    // 验证
-    for version in 1..=100 {
+    // 验证所有 100 个键
+    for i in 0..100 {
         let mut key = [0u8; 32];
-        key[0] = version as u8;
+        key[0] = i as u8;
         assert!(tree.lookup(&key).unwrap().is_some());
     }
 }
@@ -172,7 +178,7 @@ fn test_extremely_sparse_distribution() {
     for &pos in &positions {
         let mut key = [0u8; 32];
         key[pos / 8] = 1 << (7 - pos % 8);
-        tree.insert(&key, format!("pos_{}", pos).into_bytes(), 1)
+        tree.insert(&key, format!("pos_{}", pos).into_bytes())
             .unwrap();
     }
 
@@ -196,7 +202,7 @@ fn test_deep_tree_path() {
     for depth in 0..256 {
         let mut key = [0xFFu8; 32];
         key[depth / 8] &= !(1 << (7 - depth % 8));
-        tree.insert(&key, format!("depth_{}", depth).into_bytes(), 1)
+        tree.insert(&key, format!("depth_{}", depth).into_bytes())
             .unwrap();
     }
 
@@ -221,7 +227,7 @@ fn test_lookup_nonexistent_after_bulk_insert() {
     for i in (0..200).step_by(2) {
         let mut key = [0u8; 32];
         key[0] = i as u8;
-        tree.insert(&key, b"even".to_vec(), 1).unwrap();
+        tree.insert(&key, b"even".to_vec()).unwrap();
     }
 
     // 查询奇数键（不存在）
@@ -256,7 +262,6 @@ fn test_prefix_variants() {
         tree.insert(
             &key,
             format!("suffix_len_{}", suffix_len).into_bytes(),
-            1,
         )
         .unwrap();
     }

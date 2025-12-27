@@ -57,3 +57,45 @@ pub use store::KvNodeStore;
 
 // tree.rs 导出
 pub use tree::HOTTree;
+
+// ============================================================================
+// AuthDB trait 实现（需要 authdb feature）
+// ============================================================================
+
+#[cfg(feature = "authdb")]
+mod authdb_impl {
+    use crate::hash::Hasher;
+    use crate::store::NodeStore;
+    use crate::tree::HOTTree;
+    use authdb_trait::AuthDB;
+
+    impl<S: NodeStore + 'static, H: Hasher + 'static> AuthDB for HOTTree<S, H> {
+        fn get(&self, key: Vec<u8>) -> Option<Box<[u8]>> {
+            let key: [u8; 32] = key.try_into().ok()?;
+            self.lookup(&key).ok()?.map(|v| v.into_boxed_slice())
+        }
+
+        fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+            let key: [u8; 32] = key
+                .try_into()
+                .expect("key must be 32 bytes");
+            self.insert(&key, value).expect("insert failed");
+        }
+
+        fn commit(&mut self, index: usize) {
+            // 调用 HOTTree::commit，严格校验 epoch
+            HOTTree::commit(self, index as u64);
+            // 刷新缓存到底层存储
+            self.flush_cache().expect("flush failed");
+        }
+
+        fn flush_all(&mut self) {
+            self.flush_cache().expect("flush failed");
+        }
+
+        fn backend(&self) -> Option<&dyn kvdb::KeyValueDB> {
+            // TODO: 如需要可返回底层 KvNodeStore 的 backend
+            None
+        }
+    }
+}

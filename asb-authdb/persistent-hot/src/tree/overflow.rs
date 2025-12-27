@@ -20,7 +20,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         _key: &[u8; 32],
         insert_info: &InsertInformation,
         leaf_id: NodeId,
-        version: u64,
     ) -> Result<()> {
         // Step 0: C++ 对齐 - 若新 discriminative bit 更靠前，则直接创建 BiNode
         let first_bit = node
@@ -43,7 +42,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 height: bi_node_height,
             };
 
-            return self.integrate_binode_upwards(stack, &mut bi_node, version);
+            return self.integrate_binode_upwards(stack, &mut bi_node);
         }
 
         // Step 1: 使用 split_with_insert 同时完成 split 和 insert（C++ 风格）
@@ -58,9 +57,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // Step 2: 持久化两侧节点
         let (left_id, left_height) =
-            self.materialize_split_child_with_height(left_child, version)?;
+            self.materialize_split_child_with_height(left_child)?;
         let (right_id, right_height) =
-            self.materialize_split_child_with_height(right_child, version)?;
+            self.materialize_split_child_with_height(right_child)?;
 
         // Step 3: 创建 BiNode
         let max_child_height = std::cmp::max(left_height, right_height);
@@ -72,7 +71,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         };
 
         // Step 4: 向上处理（复用现有逻辑）
-        self.integrate_binode_upwards(stack, &mut bi_node, version)
+        self.integrate_binode_upwards(stack, &mut bi_node)
     }
 
     /// 将 BiNode 向上集成到父节点（提取自 handle_overflow_with_stack）
@@ -83,7 +82,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         &mut self,
         stack: &mut Vec<InsertStackEntry>,
         bi_node: &mut BiNode,
-        version: u64,
     ) -> Result<()> {
         while let Some(parent_entry) = stack.pop() {
             let parent = &parent_entry.node;
@@ -94,9 +92,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     let (d, l, r) =
                         parent.split_with_binode(parent_entry.child_index, bi_node);
                     let (l_id, l_height) =
-                        self.materialize_split_child_with_height(l, version)?;
+                        self.materialize_split_child_with_height(l)?;
                     let (r_id, r_height) =
-                        self.materialize_split_child_with_height(r, version)?;
+                        self.materialize_split_child_with_height(r)?;
 
                     *bi_node = BiNode {
                         discriminative_bit: d,
@@ -110,31 +108,29 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     let new_parent =
                         parent.with_integrated_binode(parent_entry.child_index, bi_node);
 
-                    let new_parent_id = new_parent.compute_node_id::<H>(version);
+                    let new_parent_id = new_parent.compute_node_id::<H>(self.version);
                     self.store.put_node(&new_parent_id, &new_parent)?;
                     self.propagate_pointer_updates(
                         std::mem::take(stack),
                         new_parent_id,
-                        version,
                     )?;
                     return Ok(());
                 }
             } else {
                 // Intermediate Node Creation
                 let intermediate = bi_node.to_two_entry_node();
-                let intermediate_id = intermediate.compute_node_id::<H>(version);
+                let intermediate_id = intermediate.compute_node_id::<H>(self.version);
                 self.store.put_node(&intermediate_id, &intermediate)?;
 
                 let mut new_parent = parent.clone();
                 new_parent.children[parent_entry.child_index] = intermediate_id;
                 new_parent.height = std::cmp::max(new_parent.height, intermediate.height + 1);
 
-                let new_parent_id = new_parent.compute_node_id::<H>(version);
+                let new_parent_id = new_parent.compute_node_id::<H>(self.version);
                 self.store.put_node(&new_parent_id, &new_parent)?;
                 self.propagate_pointer_updates(
                     std::mem::take(stack),
                     new_parent_id,
-                    version,
                 )?;
                 return Ok(());
             }
@@ -142,7 +138,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // 创建新 root
         let new_root = bi_node.to_two_entry_node();
-        let new_root_id = new_root.compute_node_id::<H>(version);
+        let new_root_id = new_root.compute_node_id::<H>(self.version);
         self.store.put_node(&new_root_id, &new_root)?;
         self.root_id = Some(new_root_id);
         Ok(())
@@ -176,7 +172,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
         num_affected_entries: usize,
         subtree_prefix: u32,
         leaf_id: NodeId,
-        version: u64,
     ) -> Result<()> {
         // Step 0: C++ 对齐 - 若新 discriminative bit 更靠前，则直接创建 BiNode
         // 与 handle_overflow_normal_insert 一致
@@ -200,7 +195,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 height: bi_node_height,
             };
 
-            return self.integrate_binode_upwards(stack, &mut bi_node, version);
+            return self.integrate_binode_upwards(stack, &mut bi_node);
         }
 
         // Step 1: 使用 split_with_insert 同时完成 split 和 insert（C++ 风格）
@@ -215,9 +210,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // Step 2: 持久化两侧节点
         let (left_id, left_height) =
-            self.materialize_split_child_with_height(left_child, version)?;
+            self.materialize_split_child_with_height(left_child)?;
         let (right_id, right_height) =
-            self.materialize_split_child_with_height(right_child, version)?;
+            self.materialize_split_child_with_height(right_child)?;
 
         // Step 3: 创建 BiNode
         let max_child_height = std::cmp::max(left_height, right_height);
@@ -242,9 +237,9 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     let (d, l, r) =
                         parent.split_with_binode(parent_entry.child_index, &bi_node);
                     let (l_id, l_height) =
-                        self.materialize_split_child_with_height(l, version)?;
+                        self.materialize_split_child_with_height(l)?;
                     let (r_id, r_height) =
-                        self.materialize_split_child_with_height(r, version)?;
+                        self.materialize_split_child_with_height(r)?;
                     bi_node = BiNode {
                         discriminative_bit: d,
                         left: l_id,
@@ -258,14 +253,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                     let new_parent =
                         parent.with_integrated_binode(parent_entry.child_index, &bi_node);
 
-                    let new_parent_id = new_parent.compute_node_id::<H>(version);
+                    let new_parent_id = new_parent.compute_node_id::<H>(self.version);
                     self.store.put_node(&new_parent_id, &new_parent)?;
 
                     // 向上传播指针更新（take stack 避免 clone 开销）
                     self.propagate_pointer_updates(
                         std::mem::take(stack),
                         new_parent_id,
-                        version,
                     )?;
                     return Ok(());
                 }
@@ -273,7 +267,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 // ===== INTERMEDIATE NODE CREATION =====
                 // bi_node.height < parent.height
                 let intermediate = bi_node.to_two_entry_node();
-                let intermediate_id = intermediate.compute_node_id::<H>(version);
+                let intermediate_id = intermediate.compute_node_id::<H>(self.version);
                 self.store.put_node(&intermediate_id, &intermediate)?;
 
                 // 更新父节点的 child 引用
@@ -283,14 +277,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
                 // 更新父节点高度
                 new_parent.height = std::cmp::max(new_parent.height, intermediate.height + 1);
 
-                let new_parent_id = new_parent.compute_node_id::<H>(version);
+                let new_parent_id = new_parent.compute_node_id::<H>(self.version);
                 self.store.put_node(&new_parent_id, &new_parent)?;
 
                 // 向上传播指针更新（take stack 避免 clone 开销）
                 self.propagate_pointer_updates(
                     std::mem::take(stack),
                     new_parent_id,
-                    version,
                 )?;
                 return Ok(());
             }
@@ -298,7 +291,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
         // Step 7: 到达 root 且仍需处理，创建新 root
         let new_root = bi_node.to_two_entry_node();
-        let new_root_id = new_root.compute_node_id::<H>(version);
+        let new_root_id = new_root.compute_node_id::<H>(self.version);
         self.store.put_node(&new_root_id, &new_root)?;
         self.root_id = Some(new_root_id);
 

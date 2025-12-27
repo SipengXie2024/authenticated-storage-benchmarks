@@ -17,6 +17,9 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 # KV 存储接口（可选，用于 KvNodeStore）
 kvdb = { workspace = true, optional = true }
 
+# AuthDB trait（可选，用于 benchmark 集成）
+authdb-trait = { path = "../authdb-trait", optional = true }
+
 [dev-dependencies]
 rand = "0.8"
 kvdb-memorydb = { workspace = true }
@@ -24,3 +27,4 @@ kvdb-memorydb = { workspace = true }
 [features]
 default = []
 kvdb-backend = ["kvdb"]
+authdb = ["authdb-trait"]

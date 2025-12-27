@@ -43,7 +43,7 @@ fn test_short_strings() {
 
     for s in &strings {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &strings {
@@ -63,7 +63,7 @@ fn test_long_strings() {
 
     for s in &strings {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &strings {
@@ -84,7 +84,7 @@ fn test_similar_prefix_strings() {
 
     for s in &strings {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &strings {
@@ -113,7 +113,7 @@ fn test_url_strings() {
 
     for url in &urls {
         let key = string_to_key(url);
-        tree.insert(&key, url.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, url.as_bytes().to_vec()).unwrap();
     }
 
     for url in &urls {
@@ -138,7 +138,7 @@ fn test_file_path_strings() {
 
     for path in &paths {
         let key = string_to_key(path);
-        tree.insert(&key, path.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, path.as_bytes().to_vec()).unwrap();
     }
 
     for path in &paths {
@@ -168,7 +168,7 @@ fn test_uuid_strings() {
 
     for uuid in &uuids {
         let key = string_to_key(uuid);
-        tree.insert(&key, uuid.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, uuid.as_bytes().to_vec()).unwrap();
     }
 
     for uuid in &uuids {
@@ -195,7 +195,7 @@ fn test_mixed_case_strings() {
 
     for s in &strings {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &strings {
@@ -222,7 +222,7 @@ fn test_unicode_strings() {
 
     for s in &strings {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &strings {
@@ -241,7 +241,7 @@ fn test_numeric_strings() {
 
     for s in &numbers {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &numbers {
@@ -259,7 +259,7 @@ fn test_empty_and_whitespace_strings() {
 
     for s in &strings {
         let key = string_to_key(s);
-        tree.insert(&key, s.as_bytes().to_vec(), 1).unwrap();
+        tree.insert(&key, s.as_bytes().to_vec()).unwrap();
     }
 
     for s in &strings {
