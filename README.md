@@ -10,6 +10,16 @@ This program is a modular benchmarking tool for authenticated storage, designed 
 
 The authenticated storage systems supported include:
 
+### Our Implementation
+
+- **[PersistentHOT](./asb-authdb/persistent-hot)**: A persistent Rust implementation of the Height Optimized Trie (HOT) [5], based on Binna et al. 2018 SIGMOD paper. Features include:
+  - Content-addressed storage with version isolation
+  - SIMD-accelerated (AVX2) parallel node search
+  - Copy-on-Write (COW) design for concurrent access
+  - Implements the `AuthDB` trait for benchmark integration
+
+### Baseline Implementations
+
 - The [original Merkle Patricia Trie (MPT)](https://github.com/openethereum/openethereum/tree/main/crates/db/patricia-trie-ethereum) implementation from OpenEthereum
 - The [Layered Merkle Patricia Tries (LMPTs)](https://github.com/Conflux-Chain/conflux-rust/tree/master/core/storage) [1] used in Conflux
 - A modified version of [RainBlock's MPT](https://github.com/RainBlock/merkle-patricia-tree) [2], which stores the bottom layers locally on storage instead of using a distributed in-memory system as in the original work
@@ -29,7 +39,7 @@ The collected metrics data includes:
 - Memory usage of the program
 - CPU profiling data caught by [pprof-rs](https://github.com/tikv/pprof-rs)
 
-This comprehensive toolset is developed for tuning and evaluating LVMT. It enables users to benchmark and compare various authenticated storage solutions, providing valuable insights into their performance and resource utilization.
+This comprehensive toolset is developed for tuning and evaluating PersistentHOT against established baseline implementations. It enables users to benchmark and compare various authenticated storage solutions, providing valuable insights into their performance and resource utilization.
 
 ## Building the Project
 
@@ -288,3 +298,5 @@ cargo build --release --features asb-authdb/lmpts
 [3] Chenxing Li, Sidi Mohamed Beillahi, Guang Yang, Ming Wu, Wei Xu, and Fan Long. "LVMT: An Efﬁcient Authenticated Storage for Blockchain". In *USENIX Symposium on Operating Systems Design and Implementation (OSDI)*. 2023.
 
 [4] Alin Tomescu, Robert Chen, Yiming Zheng, Ittai Abraham, Benny Pinkas, Guy Golan Gueta, and Srinivas Devadas. Towards scalable threshold cryptosystems. In Proceedings of the *2020 IEEE Symposium on Security and Privacy, pages 877–893*. IEEE, 2020.
+
+[5] Robert Binna, Eva Zangerle, Martin Pichl, Günther Specht, and Viktor Leis. "HOT: A Height Optimized Trie Index for Main-Memory Database Systems." In *Proceedings of the 2018 International Conference on Management of Data (SIGMOD '18)*, pp. 521-534. ACM, 2018.
