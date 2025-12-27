@@ -2,13 +2,13 @@
 
 use crate::hash::Hasher;
 use crate::node::{NodeId, PersistentHOTNode, SplitChild};
-use crate::store::{NodeStore, Result, StoreError};
+use crate::store::{Result, StoreError};
 
 use super::core::{HOTTree, InsertStackEntry};
 
-impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
+impl<H: Hasher> HOTTree<H> {
     /// 获取 child 的高度（Leaf=0，Internal 读取存储）
-    pub(super) fn get_child_height(&self, child_id: &NodeId) -> Result<u8> {
+    pub(super) fn get_child_height(&mut self, child_id: &NodeId) -> Result<u8> {
         if let Some(height) = child_id.height_if_leaf() {
             return Ok(height);
         }
@@ -112,7 +112,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     }
 
     /// 获取 entry 对应的 key
-    pub(super) fn get_entry_key(&self, child: &NodeId) -> Result<[u8; 32]> {
+    pub(super) fn get_entry_key(&mut self, child: &NodeId) -> Result<[u8; 32]> {
         match child {
             NodeId::Leaf(_) => {
                 let leaf = self

@@ -2,11 +2,11 @@
 
 use crate::hash::Hasher;
 use crate::node::{BiNode, InsertInformation, NodeId, PersistentHOTNode};
-use crate::store::{NodeStore, Result};
+use crate::store::Result;
 
 use super::core::{HOTTree, InsertStackEntry};
 
-impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
+impl<H: Hasher> HOTTree<H> {
     /// 处理 Normal Insert 时的节点溢出
     ///
     /// 使用 C++ 风格的 split_with_insert 同时完成 split 和 insert。

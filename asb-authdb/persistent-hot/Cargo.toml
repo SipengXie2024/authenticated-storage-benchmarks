@@ -25,6 +25,6 @@ rand = "0.8"
 kvdb-memorydb = { workspace = true }
 
 [features]
-default = []
+default = ["kvdb-backend"]
 kvdb-backend = ["kvdb"]
 authdb = ["authdb-trait"]

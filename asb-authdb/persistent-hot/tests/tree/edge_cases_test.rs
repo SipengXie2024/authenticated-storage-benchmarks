@@ -2,17 +2,17 @@
 //!
 //! 测试各种边界情况和异常场景
 
+use std::sync::Arc;
 use persistent_hot::hash::Blake3Hasher;
-use persistent_hot::store::MemoryNodeStore;
 use persistent_hot::tree::HOTTree;
 
 #[path = "../common/mod.rs"]
 mod common;
 
 /// 辅助函数：创建测试树
-fn create_test_tree() -> HOTTree<MemoryNodeStore, Blake3Hasher> {
-    let store = MemoryNodeStore::new();
-    HOTTree::new(store)
+fn create_test_tree() -> HOTTree<Blake3Hasher> {
+    let db = Arc::new(kvdb_memorydb::create(2)); // 2 columns: node and leaf
+    HOTTree::new(db, 0, 1)
 }
 
 /// 测试：重复插入相同键

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use kvdb::{DBTransaction, KeyValueDB};
 
 use super::error::{Result, StoreError};
-use super::traits::NodeStore;
 use crate::node::{LeafData, NodeId, PersistentHOTNode};
 
 /// 基于 kvdb 的节点存储
@@ -74,8 +73,9 @@ impl KvNodeStore {
     }
 }
 
-impl NodeStore for KvNodeStore {
-    fn get_node(&self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
+impl KvNodeStore {
+    /// 获取内部节点
+    pub fn get_node(&self, id: &NodeId) -> Result<Option<PersistentHOTNode>> {
         let key = self.make_key(id);
         match self.db.get(self.col_node, &key) {
             Ok(Some(bytes)) => {
@@ -88,7 +88,8 @@ impl NodeStore for KvNodeStore {
         }
     }
 
-    fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
+    /// 存储内部节点
+    pub fn put_node(&mut self, id: &NodeId, node: &PersistentHOTNode) -> Result<()> {
         let key = self.make_key(id);
         let bytes = node
             .to_bytes()
@@ -101,7 +102,8 @@ impl NodeStore for KvNodeStore {
             .map_err(|e| StoreError::StorageError(e.to_string()))
     }
 
-    fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>> {
+    /// 获取叶子数据
+    pub fn get_leaf(&self, id: &NodeId) -> Result<Option<LeafData>> {
         let key = self.make_key(id);
         match self.db.get(self.col_leaf, &key) {
             Ok(Some(bytes)) => {
@@ -114,7 +116,8 @@ impl NodeStore for KvNodeStore {
         }
     }
 
-    fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()> {
+    /// 存储叶子数据
+    pub fn put_leaf(&mut self, id: &NodeId, leaf: &LeafData) -> Result<()> {
         let key = self.make_key(id);
         let bytes = leaf
             .to_bytes()
@@ -127,13 +130,15 @@ impl NodeStore for KvNodeStore {
             .map_err(|e| StoreError::StorageError(e.to_string()))
     }
 
-    fn flush(&mut self) -> Result<()> {
+    /// 刷新缓冲区到持久化存储
+    pub fn flush(&mut self) -> Result<()> {
         self.db
             .flush()
             .map_err(|e| StoreError::StorageError(e.to_string()))
     }
 
-    fn contains_node(&self, id: &NodeId) -> Result<bool> {
+    /// 检查内部节点是否存在
+    pub fn contains_node(&self, id: &NodeId) -> Result<bool> {
         let key = self.make_key(id);
         match self.db.get(self.col_node, &key) {
             Ok(Some(_)) => Ok(true),
@@ -142,7 +147,8 @@ impl NodeStore for KvNodeStore {
         }
     }
 
-    fn contains_leaf(&self, id: &NodeId) -> Result<bool> {
+    /// 检查叶子是否存在
+    pub fn contains_leaf(&self, id: &NodeId) -> Result<bool> {
         let key = self.make_key(id);
         match self.db.get(self.col_leaf, &key) {
             Ok(Some(_)) => Ok(true),

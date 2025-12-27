@@ -5,11 +5,11 @@ use crate::node::{
     extract_bit, find_first_differing_bit, BiNode, InsertInformation, LeafData, NodeId,
     PersistentHOTNode, SearchResult,
 };
-use crate::store::{NodeStore, Result, StoreError};
+use crate::store::{Result, StoreError};
 
 use super::core::{HOTTree, InsertStackEntry};
 
-impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
+impl<H: Hasher> HOTTree<H> {
     /// 插入 key-value 对
     ///
     /// 使用树内部管理的 `self.version` 作为版本号。

@@ -49,7 +49,7 @@ pub use node::{
 pub use simd::{has_avx2, simd_batch_search, simd_search, simd_search_scalar, SimdSearchResult};
 
 // store.rs 导出
-pub use store::{CachedNodeStore, CacheStats, MemoryNodeStore, NodeStore, Result as StoreResult, StoreError};
+pub use store::{CachedNodeStore, CacheStats, Result as StoreResult, StoreError};
 
 // kvdb-backend feature 启用时导出 KvNodeStore
 #[cfg(feature = "kvdb-backend")]
@@ -65,12 +65,11 @@ pub use tree::HOTTree;
 #[cfg(feature = "authdb")]
 mod authdb_impl {
     use crate::hash::Hasher;
-    use crate::store::NodeStore;
     use crate::tree::HOTTree;
     use authdb_trait::AuthDB;
 
-    impl<S: NodeStore + 'static, H: Hasher + 'static> AuthDB for HOTTree<S, H> {
-        fn get(&self, key: Vec<u8>) -> Option<Box<[u8]>> {
+    impl<H: Hasher + 'static> AuthDB for HOTTree<H> {
+        fn get(&mut self, key: Vec<u8>) -> Option<Box<[u8]>> {
             let key: [u8; 32] = key.try_into().ok()?;
             self.lookup(&key).ok()?.map(|v| v.into_boxed_slice())
         }

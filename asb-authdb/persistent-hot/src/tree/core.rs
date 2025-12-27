@@ -1,10 +1,13 @@
 //! HOTTree 核心结构体
 
 use std::marker::PhantomData;
+use std::sync::Arc;
+
+use kvdb::KeyValueDB;
 
 use crate::hash::{Blake3Hasher, Hasher};
 use crate::node::{NodeId, PersistentHOTNode};
-use crate::store::{CachedNodeStore, NodeStore};
+use crate::store::CachedNodeStore;
 
 // ============================================================================
 // Insert Stack
@@ -33,34 +36,38 @@ pub(super) struct InsertStackEntry {
 ///
 /// # 类型参数
 ///
-/// - `S`: 底层存储实现，必须实现 `NodeStore` trait
 /// - `H`: 哈希算法，默认 Blake3
 ///
-/// # 缓存层
+/// # 存储层
 ///
-/// 树操作强制经过 `CachedNodeStore<S>` 缓存层，用户传入的底层存储会被自动包装。
+/// 树使用 `CachedNodeStore` 作为存储层，底层通过 `kvdb::KeyValueDB` 持久化。
 ///
 /// # 版本管理
 ///
 /// `version` 由树内部管理，初始为 0。
 /// 每次 `commit(epoch)` 后递增为 `epoch + 1`。
 /// 同一个 epoch 内的所有插入操作共享同一个 version。
-pub struct HOTTree<S: NodeStore, H: Hasher = Blake3Hasher> {
-    pub(super) store: CachedNodeStore<S>,
+pub struct HOTTree<H: Hasher = Blake3Hasher> {
+    pub(super) store: CachedNodeStore,
     pub(super) root_id: Option<NodeId>,
     pub(super) _marker: PhantomData<H>,
     /// 当前 pending epoch（即下一次 insert 使用的 version）
     pub(super) version: u64,
 }
 
-impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
+impl<H: Hasher> HOTTree<H> {
     /// 创建空树
     ///
-    /// 传入的底层存储会被自动包装为 `CachedNodeStore`。
+    /// # 参数
+    ///
+    /// - `db`: kvdb 后端（RocksDB、MDBX、内存等）
+    /// - `col_node`: 存储中间节点的 column family
+    /// - `col_leaf`: 存储叶子节点的 column family
+    ///
     /// 初始 version 为 0。
-    pub fn new(store: S) -> Self {
+    pub fn new(db: Arc<dyn KeyValueDB>, col_node: u32, col_leaf: u32) -> Self {
         Self {
-            store: CachedNodeStore::new(store),
+            store: CachedNodeStore::new(db, col_node, col_leaf, 0),
             root_id: None,
             _marker: PhantomData,
             version: 0,
@@ -77,13 +84,13 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
 
     /// 获取缓存存储引用
     #[inline]
-    pub fn store(&self) -> &CachedNodeStore<S> {
+    pub fn store(&self) -> &CachedNodeStore {
         &self.store
     }
 
     /// 获取可变缓存存储引用
     #[inline]
-    pub fn store_mut(&mut self) -> &mut CachedNodeStore<S> {
+    pub fn store_mut(&mut self) -> &mut CachedNodeStore {
         &mut self.store
     }
 
@@ -91,20 +98,6 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.root_id.is_none()
-    }
-
-    // ========== 底层存储访问 ==========
-
-    /// 获取底层存储引用（绕过缓存层）
-    #[inline]
-    pub fn inner_store(&self) -> &S {
-        self.store.inner()
-    }
-
-    /// 获取底层存储可变引用（绕过缓存层）
-    #[inline]
-    pub fn inner_store_mut(&mut self) -> &mut S {
-        self.store.inner_mut()
     }
 
     // ========== 缓存操作便捷方法 ==========
@@ -149,5 +142,7 @@ impl<S: NodeStore, H: Hasher> HOTTree<S, H> {
             self.version, epoch
         );
         self.version = epoch + 1;
+        // 同步更新 store 的 version_id
+        self.store.set_version_id(self.version);
     }
 }

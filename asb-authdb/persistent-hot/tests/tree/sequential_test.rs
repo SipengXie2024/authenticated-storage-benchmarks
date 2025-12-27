@@ -2,8 +2,8 @@
 //!
 //! 对应 C++ HOTSingleThreadedTest.cpp 中的顺序插入测试
 
+use std::sync::Arc;
 use persistent_hot::hash::Blake3Hasher;
-use persistent_hot::store::MemoryNodeStore;
 use persistent_hot::tree::HOTTree;
 
 #[path = "../common/mod.rs"]
@@ -12,9 +12,9 @@ mod common;
 use common::sample_data::get_sequential_keys;
 
 /// 辅助函数：创建测试树
-fn create_test_tree() -> HOTTree<MemoryNodeStore, Blake3Hasher> {
-    let store = MemoryNodeStore::new();
-    HOTTree::new(store)
+fn create_test_tree() -> HOTTree<Blake3Hasher> {
+    let db = Arc::new(kvdb_memorydb::create(2)); // 2 columns: node and leaf
+    HOTTree::new(db, 0, 1)
 }
 
 /// 测试：顺序插入 100 个值
@@ -133,7 +133,7 @@ fn test_alternating_insert() {
 /// 测试：空树查询
 #[test]
 fn test_empty_tree_lookup() {
-    let tree = create_test_tree();
+    let mut tree = create_test_tree();
 
     let key = [0u8; 32];
     let result = tree.lookup(&key);
